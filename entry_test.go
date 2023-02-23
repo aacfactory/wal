@@ -14,7 +14,8 @@ func TestEntry_Data(t *testing.T) {
 		p = append(p, '|')
 	}
 	fmt.Println(string(p))
-	entry := wal.NewEntry(1, p)
-	fmt.Println(entry.Index(), entry.Blocks(), bytes.Equal(p, entry.Data()))
+	entry := wal.NewEntry(1, []byte("0"), p)
+	key, b := entry.Data()
+	fmt.Println(entry.Index(), entry.Blocks(), string(key), bytes.Equal(p, b), string(b))
 
 }

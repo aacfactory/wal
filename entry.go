@@ -1,15 +1,18 @@
 package wal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"github.com/cespare/xxhash/v2"
 	"math"
 )
 
-func NewEntry(index uint64, p []byte) (entry Entry) {
-	code := xxhash.Sum64(p)
-	pLen := uint16(len(p))
-	size := uint16(math.Ceil(float64(pLen+8) / float64(blockSize-8)))
+func NewEntry(index uint64, key []byte, p []byte) (entry Entry) {
+	kLen := uint16(len(key))
+	content := bytes.Join([][]byte{key, p}, []byte{})
+	code := xxhash.Sum64(content)
+	pLen := uint16(len(content))
+	size := uint16(math.Ceil(float64(pLen+32) / float64(blockSize-8)))
 	entry = make([]byte, blockSize*size)
 
 	sLow := uint16(0)
@@ -21,22 +24,25 @@ func NewEntry(index uint64, p []byte) (entry Entry) {
 		if size == 1 || sHigh > pLen {
 			sHigh = pLen
 		}
-		segment := p[sLow:sHigh]
+		segment := content[sLow:sHigh]
+
 		binary.BigEndian.PutUint16(block[0:2], i)
 		binary.BigEndian.PutUint16(block[2:4], size)
 		if i == 0 {
 			binary.BigEndian.PutUint32(block[4:8], uint32(sHigh-sLow+24))
 
 			binary.BigEndian.PutUint64(block[8:16], index)
-			binary.BigEndian.PutUint64(block[16:24], 0)
+			binary.BigEndian.PutUint16(block[16:18], 0)
+			binary.BigEndian.PutUint16(block[18:20], kLen)
 			binary.BigEndian.PutUint64(block[24:32], code)
+
 			copy(block[32:], segment)
 		} else {
 			binary.BigEndian.PutUint32(block[4:8], uint32(sHigh-sLow))
 			copy(block[8:], segment)
 		}
 		sLow = sHigh
-		sHigh = sLow + blockSize - 24
+		sHigh = sLow + blockSize - 8
 	}
 	return
 }
@@ -68,27 +74,27 @@ func (entry Entry) Index() (index uint64) {
 }
 
 func (entry Entry) Commit() {
-	binary.BigEndian.PutUint64(entry[16:24], 1)
+	binary.BigEndian.PutUint16(entry[16:18], 1)
 	return
 }
 
 func (entry Entry) Committed() (ok bool) {
-	ok = binary.BigEndian.Uint64(entry[16:24]) == 1
+	ok = binary.BigEndian.Uint16(entry[16:18]) == 1
 	return
 }
 
 func (entry Entry) Discard() {
-	binary.BigEndian.PutUint64(entry[16:24], 2)
+	binary.BigEndian.PutUint16(entry[16:18], 2)
 	return
 }
 
 func (entry Entry) Discarded() (ok bool) {
-	ok = binary.BigEndian.Uint64(entry[16:24]) == 2
+	ok = binary.BigEndian.Uint16(entry[16:18]) == 2
 	return
 }
 
 func (entry Entry) Finished() (ok bool) {
-	ok = binary.BigEndian.Uint64(entry[16:24]) > 0
+	ok = binary.BigEndian.Uint16(entry[16:18]) > 0
 	return
 }
 
@@ -97,14 +103,23 @@ func (entry Entry) HashCode() (code uint64) {
 	return
 }
 
-func (entry Entry) Data() (p []byte) {
+func (entry Entry) Key() (key []byte) {
+	kLen := binary.BigEndian.Uint16(entry[18:20])
+	key = entry[8+24 : 8+24+kLen]
+	return
+}
+
+func (entry Entry) Data() (key []byte, p []byte) {
+	kLen := binary.BigEndian.Uint16(entry[18:20])
+	key = make([]byte, 0, kLen)
 	p = make([]byte, 0, len(entry))
 	n := entry.Blocks()
 	for i := uint16(0); i < n; i++ {
 		block := Block(entry[i*blockSize : i*blockSize+blockSize])
 		data := block.Data()
 		if i == 0 {
-			p = append(p, data[24:]...)
+			key = append(key, data[24:24+kLen]...)
+			p = append(p, data[24+kLen:]...)
 		} else {
 			p = append(p, data...)
 		}
@@ -113,7 +128,9 @@ func (entry Entry) Data() (p []byte) {
 }
 
 func (entry Entry) Validate() (ok bool) {
-	ok = entry.HashCode() == xxhash.Sum64(entry.Data())
+	key, p := entry.Data()
+	content := bytes.Join([][]byte{key, p}, []byte{})
+	ok = entry.HashCode() == xxhash.Sum64(content)
 	return
 }
 
