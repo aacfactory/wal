@@ -22,7 +22,7 @@ func newWal(t *testing.T) (logs *wal.WAL) {
 func TestWAL_Write(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 10; i++ {
 		index, writeErr := logs.Write([]byte(time.Now().Format(time.RFC3339)))
 		if writeErr != nil {
 			t.Error(i, "write", writeErr)
@@ -68,6 +68,20 @@ func TestWAL_Batch(t *testing.T) {
 	}
 	fmt.Println(batch.Flush())
 	fmt.Println(logs.Commit(indexes...))
+}
+
+func TestWAL_OldestUncommitted(t *testing.T) {
+	logs := newWal(t)
+	defer logs.Close()
+	fmt.Println(logs.HasCommitted(1))
+	fmt.Println(logs.Uncommitted())
+	index, has := logs.OldestUncommitted()
+	if !has {
+		fmt.Println("non")
+		return
+	}
+	fmt.Println("uncommitted", index)
+	_ = logs.Commit(index)
 }
 
 func TestWAL_CreateSnapshot(t *testing.T) {

@@ -224,6 +224,10 @@ func (wal *WAL) commit(index uint64) (err error) {
 		err = errors.Join(errors.New("wal commit log failed"), fmt.Errorf("%d was not found", index))
 		return
 	}
+	if entry.Committed() {
+		wal.uncommitted.Remove(index)
+		return
+	}
 	pos, hasPos := wal.indexes.Get(index)
 	if !hasPos {
 		wal.cache.Remove(index)
@@ -332,33 +336,17 @@ func (wal *WAL) Uncommitted() (n uint64) {
 	return
 }
 
-func (wal *WAL) OldestUncommitted() (index uint64, p []byte, has bool, err error) {
+func (wal *WAL) HasCommitted(index uint64) (ok bool) {
+	wal.locker.RLock()
+	_, got := wal.uncommitted.Get(index)
+	ok = !got
+	wal.locker.RUnlock()
+	return
+}
+
+func (wal *WAL) OldestUncommitted() (index uint64, has bool) {
 	wal.locker.RLock()
 	index, _, has = wal.uncommitted.Min()
-	if !has {
-		wal.locker.RUnlock()
-		return
-	}
-	entry, got, readErr := wal.read(index)
-	if readErr != nil {
-		if readErr == ErrInvalidEntry {
-			wal.locker.RUnlock()
-			wal.locker.Lock()
-			wal.uncommitted.Remove(index)
-			wal.indexes.Remove(index)
-			wal.cache.Remove(index)
-			wal.locker.Unlock()
-			index, p, has, err = wal.OldestUncommitted()
-			return
-		}
-		err = errors.Join(errors.New("wal get oldest uncommitted failed"), err)
-		wal.locker.RUnlock()
-		return
-	}
-	if got {
-		p = entry.Data()
-		has = true
-	}
 	wal.locker.RUnlock()
 	return
 }
