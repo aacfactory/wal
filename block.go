@@ -5,7 +5,7 @@ import (
 )
 
 const (
-	blockSize = 1024
+	blockSize = 256
 )
 
 func NewBlock() Block {
