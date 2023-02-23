@@ -52,6 +52,19 @@ func TestWAL_Write(t *testing.T) {
 	}
 }
 
+func TestWAL_WriteKey(t *testing.T) {
+	logs := newWal(t)
+	defer logs.Close()
+	fmt.Println(logs.Write(uint64(4), []byte("1")))
+	fmt.Println(logs.Write(uint64(4), []byte("2")))
+	fmt.Println(logs.CommitKey(uint64(4)))
+	index, p, state, err := logs.Key(4)
+	fmt.Println(index, string(p), state, err)
+	fmt.Println(logs.Write(uint64(4), []byte("3")))
+	index, p, state, err = logs.Key(4)
+	fmt.Println(index, string(p), state, err)
+}
+
 func TestWAL_Read(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
@@ -150,8 +163,8 @@ func TestWAL_FirstIndex(t *testing.T) {
 func TestWAL_Key(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
-	p, has, err := logs.Key(1)
-	fmt.Println(has, string(p), err)
+	index, p, has, err := logs.Key(1)
+	fmt.Println(index, has, string(p), err)
 }
 
 func TestWAL_LastKey(t *testing.T) {

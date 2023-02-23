@@ -42,7 +42,7 @@ func (state State) String() string {
 }
 
 func New[K ordered](path string, keyEncoder KeyEncoder[K]) (wal *WAL[K], err error) {
-	wal, err = NewWithCacheSize[K](path, keyEncoder, 1024)
+	wal, err = NewWithCacheSize[K](path, keyEncoder, 10240)
 	return
 }
 
@@ -219,7 +219,7 @@ func (wal *WAL[K]) Read(index uint64) (key K, p []byte, state State, err error) 
 	return
 }
 
-func (wal *WAL[K]) Key(key K) (p []byte, state State, err error) {
+func (wal *WAL[K]) Key(key K) (index uint64, p []byte, state State, err error) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
 	if wal.closed {
@@ -237,6 +237,7 @@ func (wal *WAL[K]) Key(key K) (p []byte, state State, err error) {
 		err = ErrNotFound
 		return
 	}
+	index = entry.Index()
 	_, p = entry.Data()
 	state = State(entry.State())
 	return
@@ -255,6 +256,12 @@ func (wal *WAL[K]) Write(key K, p []byte) (index uint64, err error) {
 		wal.locker.Unlock()
 		return
 	}
+	if wal.getUncommittedKey(key) {
+		err = errors.Join(errors.New("wal write failed"), errors.New("prev key was not committed or discarded"))
+		wal.locker.Unlock()
+		return
+	}
+
 	index = wal.nextIndex
 	entry := NewEntry(index, k, p)
 	writeErr := wal.file.WriteAt(entry, wal.acquireNextBlockPos())
@@ -314,6 +321,7 @@ func (wal *WAL[K]) remove(idx uint64) (err error) {
 	if entry.Removed() {
 		wal.cache.Remove(idx)
 		wal.indexes.Remove(idx)
+		wal.uncommitted.Remove(idx)
 		wal.keys.Remove(key)
 		return
 	}
@@ -328,6 +336,7 @@ func (wal *WAL[K]) remove(idx uint64) (err error) {
 
 	wal.cache.Remove(idx)
 	wal.indexes.Remove(idx)
+	wal.uncommitted.Remove(idx)
 	wal.keys.Remove(key)
 	return
 }
@@ -699,9 +708,32 @@ func (wal *WAL[K]) UncommittedSize() (n uint64) {
 func (wal *WAL[K]) Uncommitted(index uint64) (ok bool) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
+	ok = wal.getUncommitted(index)
+	wal.locker.RUnlock()
+	return
+}
+
+func (wal *WAL[K]) getUncommitted(index uint64) (ok bool) {
 	_, got := wal.uncommitted.Get(index)
 	ok = got
+	return
+}
+
+func (wal *WAL[K]) UncommittedKey(key K) (ok bool) {
+	wal.truncating.Wait()
+	wal.locker.RLock()
+	ok = wal.getUncommittedKey(key)
 	wal.locker.RUnlock()
+	return
+}
+
+func (wal *WAL[K]) getUncommittedKey(key K) (ok bool) {
+	index, has := wal.keys.Get(key)
+	if !has {
+		return
+	}
+	_, got := wal.uncommitted.Get(index)
+	ok = got
 	return
 }
 

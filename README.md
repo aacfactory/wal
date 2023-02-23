@@ -23,7 +23,7 @@ key, content, state, readErr := logs.Read(index)
 // commit
 commitErr := logs.Commit(index)
 // key
-content, state, readErr := logs.Key(1)
+index, content, state, readErr := logs.Key(1)
 // close
 logs.Close()
 ```
