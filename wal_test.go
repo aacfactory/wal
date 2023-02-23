@@ -1,6 +1,7 @@
 package wal_test
 
 import (
+	"encoding/binary"
 	"fmt"
 	"github.com/aacfactory/wal"
 	"os"
@@ -8,9 +9,23 @@ import (
 	"time"
 )
 
-func newWal(t *testing.T) (logs *wal.WAL) {
+type KeyEncoder struct {
+}
+
+func (k *KeyEncoder) Encode(key uint64) (p []byte, err error) {
+	p = make([]byte, 8)
+	binary.BigEndian.PutUint64(p, key)
+	return
+}
+
+func (k *KeyEncoder) Decode(p []byte) (key uint64, err error) {
+	key = binary.BigEndian.Uint64(p)
+	return
+}
+
+func newWal(t *testing.T) (logs *wal.WAL[uint64]) {
 	var err error
-	logs, err = wal.New(`G:\tmp\wal\1.txt`)
+	logs, err = wal.New[uint64](`G:\tmp\wal\1.txt`, &KeyEncoder{})
 	if err != nil {
 		t.Error(err)
 		os.Exit(9)
@@ -23,7 +38,7 @@ func TestWAL_Write(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
 	for i := 0; i < 10; i++ {
-		index, writeErr := logs.Write([]byte(fmt.Sprintf("%d", i)), []byte(time.Now().Format(time.RFC3339)))
+		index, writeErr := logs.Write(uint64(i), []byte(time.Now().Format(time.RFC3339)))
 		if writeErr != nil {
 			t.Error(i, "write", writeErr)
 			return
@@ -52,7 +67,7 @@ func TestWAL_Read(t *testing.T) {
 			t.Error(i, "read:", readErr)
 			continue
 		}
-		fmt.Println(i, "read:", string(key), state, string(p))
+		fmt.Println(i, "read:", key, state, string(p))
 	}
 	fmt.Println(logs.UncommittedSize())
 }
@@ -64,7 +79,12 @@ func TestWAL_Batch(t *testing.T) {
 	defer batch.Close()
 	indexes := make([]uint64, 0, 1)
 	for i := 0; i < 3; i++ {
-		indexes = append(indexes, batch.Write([]byte(fmt.Sprintf("%d", i)), []byte(time.Now().Format(time.RFC3339))))
+		index, err := batch.Write(uint64(i), []byte(time.Now().Format(time.RFC3339)))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		indexes = append(indexes, index)
 	}
 	fmt.Println(batch.Flush())
 	fmt.Println(logs.Commit(indexes...))
@@ -97,8 +117,8 @@ type SnapshotSink struct {
 func (s *SnapshotSink) Write(p []byte) (n int, err error) {
 	entries := wal.DecodeEntries(p)
 	for _, entry := range entries {
-		key, p := entry.Data()
-		fmt.Println("write:", entry.Index(), string(key), string(p))
+		key, data := entry.Data()
+		fmt.Println("write:", entry.Index(), string(key), string(data))
 	}
 	n = len(p)
 	return
@@ -130,6 +150,21 @@ func TestWAL_FirstIndex(t *testing.T) {
 func TestWAL_Key(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
-	p, has, err := logs.Key([]byte("-1"))
+	p, has, err := logs.Key(1)
 	fmt.Println(has, string(p), err)
+}
+
+func TestWAL_LastKey(t *testing.T) {
+	logs := newWal(t)
+	defer logs.Close()
+	fmt.Println(logs.FirstKey())
+	fmt.Println(logs.LastKey())
+}
+
+func TestWAL_RemoveKey(t *testing.T) {
+	logs := newWal(t)
+	defer logs.Close()
+	fmt.Println(logs.RemoveKey(0))
+	fmt.Println("-----")
+	fmt.Println(logs.Remove(18))
 }

@@ -34,6 +34,7 @@ func NewEntry(index uint64, key []byte, p []byte) (entry Entry) {
 			binary.BigEndian.PutUint64(block[8:16], index)
 			binary.BigEndian.PutUint16(block[16:18], 1)
 			binary.BigEndian.PutUint16(block[18:20], kLen)
+			binary.BigEndian.PutUint16(block[20:22], 1)
 			binary.BigEndian.PutUint64(block[24:32], code)
 
 			copy(block[32:], segment)
@@ -99,6 +100,16 @@ func (entry Entry) Discarded() (ok bool) {
 
 func (entry Entry) Finished() (ok bool) {
 	ok = binary.BigEndian.Uint16(entry[16:18]) > 1
+	return
+}
+
+func (entry Entry) Removed() (ok bool) {
+	ok = binary.BigEndian.Uint16(entry[20:22]) == 0
+	return
+}
+
+func (entry Entry) Remove() {
+	binary.BigEndian.PutUint16(entry[20:22], 0)
 	return
 }
 
