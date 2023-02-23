@@ -12,7 +12,7 @@ type Batch struct {
 }
 
 func (batch *Batch) Write(p []byte) (index uint64) {
-	index = batch.wal.nextIndex
+	index = batch.nextIndex
 	entry := NewEntry(index, p)
 	batch.data = append(batch.data, entry...)
 	batch.nextIndex++

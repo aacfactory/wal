@@ -135,8 +135,8 @@ func (wal *WAL) read(index uint64) (entry Entry, has bool, err error) {
 	if has {
 		if !entry.Validate() {
 			err = ErrInvalidEntry
+			return
 		}
-		err = ErrInvalidEntry
 		return
 	}
 	pos, hasPos := wal.indexes.Get(index)
@@ -144,6 +144,20 @@ func (wal *WAL) read(index uint64) (entry Entry, has bool, err error) {
 		err = errors.Join(errors.New("wal read failed"), fmt.Errorf("%d was not found", index))
 		return
 	}
+	entry, err = wal.readFromFile(pos)
+	if err != nil {
+		if err == ErrInvalidEntry {
+			return
+		}
+		err = errors.Join(errors.New("wal read failed"), err)
+		return
+	}
+	has = true
+	wal.cache.Add(index, entry)
+	return
+}
+
+func (wal *WAL) readFromFile(pos uint64) (entry Entry, err error) {
 	block := NewBlock()
 	readErr := wal.file.ReadAt(block, pos)
 	if readErr != nil {
@@ -161,7 +175,6 @@ func (wal *WAL) read(index uint64) (entry Entry, has bool, err error) {
 			err = ErrInvalidEntry
 			return
 		}
-		wal.cache.Add(index, entry)
 		return
 	}
 	entry = make([]byte, blockSize*span)
@@ -174,8 +187,6 @@ func (wal *WAL) read(index uint64) (entry Entry, has bool, err error) {
 		err = ErrInvalidEntry
 		return
 	}
-	has = true
-	wal.cache.Add(index, entry)
 	return
 }
 
@@ -260,7 +271,7 @@ func (wal *WAL) commitBatch(indexes []uint64) (err error) {
 	pos := items[0].pos
 	segment := make([]byte, 0, blockSize)
 	segment = append(segment, items[0].entry...)
-	for i := 1; i <= len(items); i++ {
+	for i := 1; i < len(items); i++ {
 		low := items[i-1].pos
 		high := items[i].pos
 		lowLen := uint64(len(items[i-1].entry))
@@ -308,7 +319,7 @@ func (wal *WAL) Batch() (batch *Batch) {
 	batch = &Batch{
 		wal:       wal,
 		data:      make([]byte, 0, blockSize),
-		nextIndex: 0,
+		nextIndex: wal.nextIndex,
 		released:  false,
 	}
 	return
@@ -330,7 +341,8 @@ func (wal *WAL) load() (err error) {
 	}
 	readBlockIndex := uint64(0)
 	for readBlockIndex < wal.nextBlockIndex {
-		entry, has, readErr := wal.read(readBlockIndex)
+		pos := readBlockIndex * blockSize
+		entry, readErr := wal.readFromFile(pos)
 		if readErr != nil {
 			if readErr != ErrInvalidEntry {
 				err = errors.Join(errors.New("wal load failed"), readErr)
@@ -338,11 +350,7 @@ func (wal *WAL) load() (err error) {
 			}
 			continue
 		}
-		if !has {
-			continue
-		}
 		index := entry.Index()
-		pos := readBlockIndex * blockSize
 		wal.indexes.Set(index, pos)
 		if !entry.Committed() {
 			wal.uncommitted.Set(index, pos)
@@ -369,6 +377,7 @@ func (wal *WAL) CreateSnapshot(sink io.Writer) (err error) {
 	}
 	wal.snapshotting = true
 	wal.locker.Unlock()
+	defer wal.closeSnapshotting()
 	// get oldest uncommitted entry
 	wal.locker.RLock()
 	minIndex, _, hasMin := wal.uncommitted.Min()
@@ -412,4 +421,10 @@ func (wal *WAL) CreateSnapshot(sink io.Writer) (err error) {
 		reads = 0
 	}
 	return
+}
+
+func (wal *WAL) closeSnapshotting() {
+	wal.locker.Lock()
+	wal.snapshotting = false
+	wal.locker.Unlock()
 }
