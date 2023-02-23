@@ -80,7 +80,6 @@ func TestWAL_OldestUncommitted(t *testing.T) {
 		return
 	}
 	fmt.Println("uncommitted", index, logs.HasCommitted(index))
-
 }
 
 func TestWAL_CreateSnapshot(t *testing.T) {
@@ -102,4 +101,27 @@ func (s *SnapshotSink) Write(p []byte) (n int, err error) {
 	}
 	n = len(p)
 	return
+}
+
+func TestWAL_TruncateFront(t *testing.T) {
+	logs := newWal(t)
+	defer logs.Close()
+	fmt.Println(logs.TruncateFront(5))
+	fmt.Println(logs.FirstIndex())
+}
+
+func TestWAL_TruncateBack(t *testing.T) {
+	logs := newWal(t)
+	defer logs.Close()
+	fmt.Println(logs.TruncateBack(13))
+	fmt.Println(logs.FirstIndex())
+	fmt.Println(logs.LastIndex())
+}
+
+func TestWAL_FirstIndex(t *testing.T) {
+	logs := newWal(t)
+	defer logs.Close()
+	fmt.Println(logs.FirstIndex())
+	fmt.Println(logs.LastIndex())
+	fmt.Println(logs.Len())
 }
