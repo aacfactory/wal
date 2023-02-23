@@ -25,7 +25,7 @@ func (batch *Batch) Flush() (err error) {
 		return
 	}
 	if batch.wal.closed {
-		err = errors.Join(errors.New("flush batch wrote failed"), errors.New("wal was closed"))
+		err = ErrClosed
 		return
 	}
 	writeErr := batch.wal.file.WriteAt(batch.data, batch.wal.acquireNextBlockPos())
