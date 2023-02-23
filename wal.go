@@ -439,6 +439,20 @@ func (wal *WAL) CreateSnapshot(sink io.Writer) (err error) {
 		buf.Reset()
 		reads = 0
 	}
+	if buf.Len() > 0 {
+		p := buf.Bytes()
+		pLen := len(p)
+		n := 0
+		for n < pLen {
+			nn, writeErr := sink.Write(p[n:])
+			if writeErr != nil {
+				err = errors.Join(errors.New("wal create snapshot failed"), writeErr)
+				return
+			}
+			n += nn
+		}
+		buf.Reset()
+	}
 	return
 }
 
