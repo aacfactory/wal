@@ -32,7 +32,7 @@ func NewEntry(index uint64, key []byte, p []byte) (entry Entry) {
 			binary.BigEndian.PutUint32(block[4:8], uint32(sHigh-sLow+24))
 
 			binary.BigEndian.PutUint64(block[8:16], index)
-			binary.BigEndian.PutUint16(block[16:18], 0)
+			binary.BigEndian.PutUint16(block[16:18], 1)
 			binary.BigEndian.PutUint16(block[18:20], kLen)
 			binary.BigEndian.PutUint64(block[24:32], code)
 
@@ -73,28 +73,32 @@ func (entry Entry) Index() (index uint64) {
 	return
 }
 
+func (entry Entry) State() uint16 {
+	return binary.BigEndian.Uint16(entry[16:18])
+}
+
 func (entry Entry) Commit() {
-	binary.BigEndian.PutUint16(entry[16:18], 1)
-	return
-}
-
-func (entry Entry) Committed() (ok bool) {
-	ok = binary.BigEndian.Uint16(entry[16:18]) == 1
-	return
-}
-
-func (entry Entry) Discard() {
 	binary.BigEndian.PutUint16(entry[16:18], 2)
 	return
 }
 
-func (entry Entry) Discarded() (ok bool) {
+func (entry Entry) Committed() (ok bool) {
 	ok = binary.BigEndian.Uint16(entry[16:18]) == 2
 	return
 }
 
+func (entry Entry) Discard() {
+	binary.BigEndian.PutUint16(entry[16:18], 3)
+	return
+}
+
+func (entry Entry) Discarded() (ok bool) {
+	ok = binary.BigEndian.Uint16(entry[16:18]) == 3
+	return
+}
+
 func (entry Entry) Finished() (ok bool) {
-	ok = binary.BigEndian.Uint16(entry[16:18]) > 0
+	ok = binary.BigEndian.Uint16(entry[16:18]) > 1
 	return
 }
 
