@@ -47,14 +47,14 @@ func TestWAL_Read(t *testing.T) {
 	}
 	fmt.Println(lastIndex)
 	for i := uint64(0); i < lastIndex; i++ {
-		p, has, readErr := logs.Read(i)
+		p, state, readErr := logs.Read(i)
 		if readErr != nil {
 			t.Error(i, "read:", readErr)
 			continue
 		}
-		fmt.Println(i, "read:", has, string(p))
+		fmt.Println(i, "read:", state, string(p))
 	}
-	fmt.Println(logs.Uncommitted())
+	fmt.Println(logs.UncommittedSize())
 }
 
 func TestWAL_Batch(t *testing.T) {
@@ -73,13 +73,13 @@ func TestWAL_Batch(t *testing.T) {
 func TestWAL_OldestUncommitted(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
-	fmt.Println(logs.Uncommitted())
+	fmt.Println(logs.UncommittedSize())
 	index, has := logs.OldestUncommitted()
 	if !has {
 		fmt.Println("non")
 		return
 	}
-	fmt.Println("uncommitted", index, logs.HasCommitted(index))
+	fmt.Println("uncommitted", index, logs.Uncommitted(index))
 }
 
 func TestWAL_CreateSnapshot(t *testing.T) {

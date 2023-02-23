@@ -3,6 +3,8 @@ package wal
 import (
 	"errors"
 	"fmt"
+	"github.com/aacfactory/wal/btree"
+	"github.com/aacfactory/wal/lru"
 	"github.com/valyala/bytebufferpool"
 	"io"
 	"os"
@@ -16,6 +18,27 @@ var (
 	ErrNoFirstIndex = errors.New("wal has no first index")
 	ErrNoLastIndex  = errors.New("wal has no last index")
 )
+
+const (
+	UncommittedState = State(iota)
+	CommittedState
+	DiscardedState
+)
+
+type State int
+
+func (state State) String() string {
+	switch state {
+	case UncommittedState:
+		return "uncommitted"
+	case DiscardedState:
+		return "discarded"
+	case CommittedState:
+		return "committed"
+	default:
+		return fmt.Sprintf("Unknown(%d)", state)
+	}
+}
 
 func New(path string) (wal *WAL, err error) {
 	wal, err = NewWithCacheSize(path, 1024)
@@ -55,12 +78,12 @@ func NewWithCacheSize(path string, cacheSize uint32) (wal *WAL, err error) {
 	}
 	wal = &WAL{
 		locker:       sync.RWMutex{},
-		indexes:      NewIndexTree(),
-		cache:        NewLRU(cacheSize),
+		indexes:      btree.New[uint64, uint64](),
+		cache:        lru.New[uint64, Entry](cacheSize),
 		file:         file,
 		nextIndex:    0,
 		nextBlockPos: 0,
-		uncommitted:  NewIndexTree(),
+		uncommitted:  btree.New[uint64, uint64](),
 		closed:       false,
 		snapshotting: false,
 		truncating:   sync.WaitGroup{},
@@ -71,12 +94,12 @@ func NewWithCacheSize(path string, cacheSize uint32) (wal *WAL, err error) {
 
 type WAL struct {
 	locker       sync.RWMutex
-	indexes      *IndexTree
-	cache        *LRU
+	indexes      *btree.BTree[uint64, uint64]
+	cache        *lru.LRU[uint64, Entry]
 	file         *File
 	nextIndex    uint64
 	nextBlockPos uint64
-	uncommitted  *IndexTree
+	uncommitted  *btree.BTree[uint64, uint64]
 	snapshotting bool
 	truncating   sync.WaitGroup
 	closed       bool
@@ -124,7 +147,7 @@ func (wal *WAL) Len() (n uint64) {
 	return
 }
 
-func (wal *WAL) Read(index uint64) (p []byte, has bool, err error) {
+func (wal *WAL) Read(index uint64) (p []byte, state State, err error) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
 	if wal.closed {
@@ -142,7 +165,13 @@ func (wal *WAL) Read(index uint64) (p []byte, has bool, err error) {
 		return
 	}
 	p = entry.Data()
-	has = true
+	if entry.Committed() {
+		state = CommittedState
+	} else if entry.Discarded() {
+		state = DiscardedState
+	} else {
+		state = UncommittedState
+	}
 	return
 }
 
@@ -261,50 +290,85 @@ func (wal *WAL) Commit(indexes ...uint64) (err error) {
 		return
 	}
 	if len(indexes) == 1 {
-		err = wal.commit(indexes[0])
+		err = wal.commitOrDiscard(indexes[0], false)
 	} else {
-		err = wal.commitBatch(indexes)
+		err = wal.commitOrDiscardBatch(indexes, false)
+	}
+	if err != nil {
+		err = errors.Join(errors.New("wal commit log failed"), err)
 	}
 	wal.locker.Unlock()
 	return
 }
 
-func (wal *WAL) commit(index uint64) (err error) {
+func (wal *WAL) Discard(indexes ...uint64) (err error) {
+	wal.truncating.Wait()
+	if indexes == nil || len(indexes) == 0 {
+		return
+	}
+	wal.locker.Lock()
+	if wal.closed {
+		err = ErrClosed
+		wal.locker.Unlock()
+		return
+	}
+	if wal.uncommitted.Len() == 0 {
+		err = errors.Join(errors.New("wal discard log failed"), errors.New("there is no uncommitted"))
+		wal.locker.Unlock()
+		return
+	}
+	if len(indexes) == 1 {
+		err = wal.commitOrDiscard(indexes[0], true)
+	} else {
+		err = wal.commitOrDiscardBatch(indexes, true)
+	}
+	if err != nil {
+		err = errors.Join(errors.New("wal discard log failed"), err)
+	}
+	wal.locker.Unlock()
+	return
+}
+
+func (wal *WAL) commitOrDiscard(index uint64, discard bool) (err error) {
 	_, uncommitted := wal.uncommitted.Get(index)
 	if !uncommitted {
-		err = errors.Join(errors.New("wal commit log failed"), fmt.Errorf("%d was not found", index))
+		err = fmt.Errorf("%d was not found", index)
 		return
 	}
 	entry, has, readErr := wal.read(index)
 	if readErr != nil {
-		err = errors.Join(errors.New("wal commit log failed"), readErr)
+		err = readErr
 		return
 	}
 	if !has {
-		err = errors.Join(errors.New("wal commit log failed"), fmt.Errorf("%d was not found", index))
+		err = fmt.Errorf("%d was not found", index)
 		return
 	}
-	if entry.Committed() {
+	if entry.Finished() {
 		wal.uncommitted.Remove(index)
 		return
 	}
 	pos, hasPos := wal.indexes.Get(index)
 	if !hasPos {
 		wal.cache.Remove(index)
-		err = errors.Join(errors.New("wal commit log failed"), fmt.Errorf("%d was not found", index))
+		err = fmt.Errorf("%d was not found", index)
 		return
 	}
-	entry.Commit()
+	if discard {
+		entry.Discard()
+	} else {
+		entry.Commit()
+	}
 	writeErr := wal.file.WriteAt(entry, pos)
 	if writeErr != nil {
-		err = errors.Join(errors.New("wal commit log failed"), fmt.Errorf("commit %d failed", index), writeErr)
+		err = writeErr
 		return
 	}
 	wal.uncommitted.Remove(index)
 	return
 }
 
-func (wal *WAL) commitBatch(indexes []uint64) (err error) {
+func (wal *WAL) commitOrDiscardBatch(indexes []uint64, discard bool) (err error) {
 	items := posEntries(make([]*posEntry, 0, len(indexes)))
 	for _, index := range indexes {
 		_, uncommitted := wal.uncommitted.Get(index)
@@ -313,17 +377,17 @@ func (wal *WAL) commitBatch(indexes []uint64) (err error) {
 		}
 		entry, has, readErr := wal.read(index)
 		if readErr != nil {
-			err = errors.Join(errors.New("wal commit log failed"), readErr)
+			err = readErr
 			return
 		}
 		if !has {
-			err = errors.Join(errors.New("wal commit log failed"), fmt.Errorf("%d was not found", index))
+			err = fmt.Errorf("%d was not found", index)
 			return
 		}
 		pos, hasPos := wal.indexes.Get(index)
 		if !hasPos {
 			wal.cache.Remove(index)
-			err = errors.Join(errors.New("wal commit log failed"), fmt.Errorf("%d was not found", index))
+			err = fmt.Errorf("%d was not found", index)
 			return
 		}
 		items = append(items, &posEntry{
@@ -349,18 +413,22 @@ func (wal *WAL) commitBatch(indexes []uint64) (err error) {
 
 		readErr := wal.file.ReadAt(lost, lostPos)
 		if readErr != nil {
-			err = errors.Join(errors.New("wal commit log failed"), readErr)
+			err = readErr
 			return
 		}
 		segment = append(segment, lost...)
 		segment = append(segment, items[i].entry...)
 	}
 	for _, item := range items {
-		item.entry.Commit()
+		if discard {
+			item.entry.Discard()
+		} else {
+			item.entry.Commit()
+		}
 	}
 	updateErr := wal.file.WriteAt(segment, pos)
 	if updateErr != nil {
-		err = errors.Join(errors.New("wal commit log failed"), updateErr)
+		err = updateErr
 		return
 	}
 	for _, item := range items {
@@ -393,7 +461,7 @@ func (wal *WAL) Batch() (batch *Batch) {
 	return
 }
 
-func (wal *WAL) Uncommitted() (n uint64) {
+func (wal *WAL) UncommittedSize() (n uint64) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
 	n = uint64(wal.uncommitted.Len())
@@ -401,11 +469,11 @@ func (wal *WAL) Uncommitted() (n uint64) {
 	return
 }
 
-func (wal *WAL) HasCommitted(index uint64) (ok bool) {
+func (wal *WAL) Uncommitted(index uint64) (ok bool) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
 	_, got := wal.uncommitted.Get(index)
-	ok = !got
+	ok = got
 	wal.locker.RUnlock()
 	return
 }
@@ -438,7 +506,7 @@ func (wal *WAL) load() (err error) {
 		}
 		index := entry.Index()
 		wal.indexes.Set(index, pos)
-		if !entry.Committed() {
+		if !entry.Finished() {
 			wal.uncommitted.Set(index, pos)
 		}
 		readBlockIndex += uint64(entry.Blocks())

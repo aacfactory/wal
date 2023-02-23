@@ -77,6 +77,21 @@ func (entry Entry) Committed() (ok bool) {
 	return
 }
 
+func (entry Entry) Discard() {
+	binary.BigEndian.PutUint64(entry[16:24], 2)
+	return
+}
+
+func (entry Entry) Discarded() (ok bool) {
+	ok = binary.BigEndian.Uint64(entry[16:24]) == 2
+	return
+}
+
+func (entry Entry) Finished() (ok bool) {
+	ok = binary.BigEndian.Uint64(entry[16:24]) > 0
+	return
+}
+
 func (entry Entry) HashCode() (code uint64) {
 	code = binary.BigEndian.Uint64(entry[24:32])
 	return
