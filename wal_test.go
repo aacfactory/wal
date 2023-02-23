@@ -86,7 +86,7 @@ func TestWAL_OldestUncommitted(t *testing.T) {
 func TestWAL_CreateSnapshot(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
-	err := logs.CreateSnapshot(&SnapshotSink{})
+	err := logs.CreateSnapshot(10, &SnapshotSink{})
 	if err != nil {
 		t.Error(err)
 	}

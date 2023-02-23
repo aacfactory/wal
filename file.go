@@ -90,6 +90,13 @@ func (f *File) WriteAt(p []byte, start uint64) (err error) {
 	return
 }
 
+func (f *File) Truncate(end uint64) (err error) {
+	f.locker.Lock()
+	err = f.file.Truncate(int64(end))
+	f.locker.Unlock()
+	return
+}
+
 func (f *File) Close() {
 	f.locker.Lock()
 	_ = f.file.Sync()

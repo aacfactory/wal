@@ -147,6 +147,7 @@ func (wal *WAL) read(index uint64) (entry Entry, has bool, err error) {
 	entry, err = wal.readFromFile(pos)
 	if err != nil {
 		if err == ErrInvalidEntry {
+			has = true
 			return
 		}
 		err = errors.Join(errors.New("wal read failed"), err)
@@ -387,7 +388,8 @@ func (wal *WAL) load() (err error) {
 	return
 }
 
-func (wal *WAL) CreateSnapshot(sink io.Writer) (err error) {
+// CreateSnapshot contains end index
+func (wal *WAL) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 	wal.locker.Lock()
 	if wal.snapshotting {
 		err = errors.Join(errors.New("wal create snapshot failed"), errors.New("the last snapshot has not been completed"))
@@ -399,9 +401,18 @@ func (wal *WAL) CreateSnapshot(sink io.Writer) (err error) {
 	defer wal.closeSnapshotting()
 	// get oldest uncommitted entry
 	wal.locker.RLock()
-	minIndex, _, hasMin := wal.uncommitted.Min()
+	firstIndex, _, hasFirst := wal.indexes.Min()
+	minUncommittedIndex, _, hasUncommittedMin := wal.uncommitted.Min()
 	wal.locker.RUnlock()
-	if !hasMin {
+	if !hasFirst {
+		return
+	}
+	if hasUncommittedMin && minUncommittedIndex <= endIndex {
+		err = errors.Join(errors.New("wal create snapshot failed"), errors.New("min uncommitted index is less than end index"))
+		return
+	}
+	if endIndex < firstIndex {
+		err = errors.Join(errors.New("wal create snapshot failed"), errors.New("end index is less than first index"))
 		return
 	}
 
@@ -409,7 +420,7 @@ func (wal *WAL) CreateSnapshot(sink io.Writer) (err error) {
 	reads := 0
 	buf := bytebufferpool.Get()
 	defer bytebufferpool.Put(buf)
-	for i := uint64(0); i < minIndex; i++ {
+	for i := firstIndex; i <= endIndex; i++ {
 		entry, has, readErr := wal.read(i)
 		if readErr != nil {
 			if readErr != ErrInvalidEntry {
@@ -460,4 +471,45 @@ func (wal *WAL) closeSnapshotting() {
 	wal.locker.Lock()
 	wal.snapshotting = false
 	wal.locker.Unlock()
+}
+
+func (wal *WAL) Truncate(endIndex uint64) (err error) {
+	wal.locker.Lock()
+	defer wal.locker.Unlock()
+	pos, hasPos := wal.indexes.Get(endIndex)
+	if !hasPos {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d was not found", endIndex)))
+		return
+	}
+	entry, has, readErr := wal.read(endIndex)
+	if readErr != nil && readErr != ErrInvalidEntry {
+		err = errors.Join(errors.New("wal truncate failed"), readErr)
+		return
+	}
+	if !has {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d was not found", endIndex)))
+		return
+	}
+
+	minUncommittedIndex, _, hasUncommittedMin := wal.uncommitted.Min()
+	if hasUncommittedMin && minUncommittedIndex <= endIndex {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New("min uncommitted index is less than end index"))
+		return
+	}
+	firstIndex, _, hasFirst := wal.indexes.Min()
+	if !hasFirst {
+		return
+	}
+	if endIndex < firstIndex {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New("end index is less than first index"))
+		return
+	}
+
+	pos = pos + uint64(len(entry))
+	err = wal.file.Truncate(pos)
+	if err != nil {
+		err = errors.Join(errors.New("wal truncate failed"), err)
+		return
+	}
+	return
 }
