@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"github.com/valyala/bytebufferpool"
 	"io"
+	"os"
 	"sort"
 	"sync"
 )
 
 var (
 	ErrInvalidEntry = errors.New("invalid entry")
+	ErrClosed       = errors.New("wal was closed")
+	ErrNoFirstIndex = errors.New("wal has no first index")
+	ErrNoLastIndex  = errors.New("wal has no last index")
 )
 
 func New(path string) (wal *WAL, err error) {
@@ -21,65 +25,113 @@ func New(path string) (wal *WAL, err error) {
 func NewWithCacheSize(path string, cacheSize uint32) (wal *WAL, err error) {
 	file, openErr := OpenFile(path)
 	if openErr != nil {
-		err = errors.Join(errors.New("create wal failed"), openErr)
-		return
+		// exist .truncated
+		if !ExistFile(path + ".truncated") {
+			err = errors.Join(errors.New("create wal failed"), openErr)
+			return
+		}
+		// open .truncated
+		file, openErr = OpenFile(path + ".truncated")
+		if openErr != nil {
+			err = errors.Join(errors.New("create wal failed"), openErr)
+			return
+		}
+		file.Close()
+		// rename
+		renameErr := os.Rename(path+".truncated", path)
+		if renameErr != nil {
+			err = errors.Join(errors.New("create wal failed"), renameErr)
+			return
+		}
+		// reopen
+		file, openErr = OpenFile(path)
+		if openErr != nil {
+			err = errors.Join(errors.New("create wal failed"), openErr)
+			return
+		}
 	}
 	if cacheSize == 0 {
 		cacheSize = 1024
 	}
 	wal = &WAL{
-		locker:         sync.RWMutex{},
-		indexes:        NewIndexTree(),
-		cache:          NewLRU(cacheSize),
-		file:           file,
-		firstIndex:     0,
-		nextIndex:      0,
-		nextBlockIndex: 0,
-		uncommitted:    NewIndexTree(),
-		closed:         false,
-		snapshotting:   false,
+		locker:       sync.RWMutex{},
+		indexes:      NewIndexTree(),
+		cache:        NewLRU(cacheSize),
+		file:         file,
+		nextIndex:    0,
+		nextBlockPos: 0,
+		uncommitted:  NewIndexTree(),
+		closed:       false,
+		snapshotting: false,
+		truncating:   sync.WaitGroup{},
 	}
 	err = wal.load()
 	return
 }
 
 type WAL struct {
-	locker         sync.RWMutex
-	indexes        *IndexTree
-	cache          *LRU
-	file           *File
-	firstIndex     uint64
-	nextIndex      uint64
-	nextBlockIndex uint64
-	uncommitted    *IndexTree
-	snapshotting   bool
-	closed         bool
+	locker       sync.RWMutex
+	indexes      *IndexTree
+	cache        *LRU
+	file         *File
+	nextIndex    uint64
+	nextBlockPos uint64
+	uncommitted  *IndexTree
+	snapshotting bool
+	truncating   sync.WaitGroup
+	closed       bool
 }
 
 func (wal *WAL) FirstIndex() (idx uint64, err error) {
+	wal.truncating.Wait()
 	wal.locker.RLock()
 	defer wal.locker.RUnlock()
-	if wal.nextIndex == 0 {
-		err = errors.New("no entry was wrote")
+	if wal.closed {
+		err = ErrClosed
 		return
 	}
-	idx = wal.firstIndex
+	has := false
+	idx, _, has = wal.indexes.Min()
+	if !has {
+		err = ErrNoFirstIndex
+		return
+	}
 	return
 }
 
 func (wal *WAL) LastIndex() (idx uint64, err error) {
+	wal.truncating.Wait()
 	wal.locker.RLock()
 	defer wal.locker.RUnlock()
-	if wal.nextIndex == 0 {
-		err = errors.New("no entry was wrote")
+	if wal.closed {
+		err = ErrClosed
 		return
 	}
-	idx = wal.nextIndex - 1
+	has := false
+	idx, _, has = wal.indexes.Max()
+	if !has {
+		err = ErrNoLastIndex
+		return
+	}
+	return
+}
+
+func (wal *WAL) Len() (n uint64) {
+	wal.truncating.Wait()
+	wal.locker.RLock()
+	n = uint64(wal.indexes.Len())
+	wal.locker.RUnlock()
 	return
 }
 
 func (wal *WAL) Read(index uint64) (p []byte, has bool, err error) {
+	wal.truncating.Wait()
 	wal.locker.RLock()
+	if wal.closed {
+		err = ErrClosed
+		wal.locker.RUnlock()
+		return
+	}
 	entry, got, readErr := wal.read(index)
 	wal.locker.RUnlock()
 	if readErr != nil {
@@ -95,9 +147,10 @@ func (wal *WAL) Read(index uint64) (p []byte, has bool, err error) {
 }
 
 func (wal *WAL) Write(p []byte) (index uint64, err error) {
+	wal.truncating.Wait()
 	wal.locker.Lock()
 	if wal.closed {
-		err = errors.Join(errors.New("write write failed"), errors.New("wal was closed"))
+		err = ErrClosed
 		wal.locker.Unlock()
 		return
 	}
@@ -115,7 +168,7 @@ func (wal *WAL) Write(p []byte) (index uint64, err error) {
 }
 
 func (wal *WAL) acquireNextBlockPos() (pos uint64) {
-	pos = wal.nextBlockIndex * blockSize
+	pos = wal.nextBlockPos * blockSize
 	return
 }
 
@@ -126,7 +179,7 @@ func (wal *WAL) mountUncommitted(entry Entry) {
 	wal.indexes.Set(index, pos)
 	wal.uncommitted.Set(index, pos)
 	wal.nextIndex++
-	wal.nextBlockIndex += uint64(entry.Blocks())
+	wal.nextBlockPos += uint64(entry.Blocks())
 	return
 }
 
@@ -192,10 +245,16 @@ func (wal *WAL) readFromFile(pos uint64) (entry Entry, err error) {
 }
 
 func (wal *WAL) Commit(indexes ...uint64) (err error) {
+	wal.truncating.Wait()
 	if indexes == nil || len(indexes) == 0 {
 		return
 	}
 	wal.locker.Lock()
+	if wal.closed {
+		err = ErrClosed
+		wal.locker.Unlock()
+		return
+	}
 	if wal.uncommitted.Len() == 0 {
 		err = errors.Join(errors.New("wal commit log failed"), errors.New("there is no uncommitted"))
 		wal.locker.Unlock()
@@ -312,14 +371,18 @@ func (wal *WAL) commitBatch(indexes []uint64) (err error) {
 }
 
 func (wal *WAL) Close() {
+	wal.truncating.Wait()
 	wal.locker.Lock()
-	wal.closed = true
-	wal.file.Close()
+	if !wal.closed {
+		wal.closed = true
+		wal.file.Close()
+	}
 	wal.locker.Unlock()
 	return
 }
 
 func (wal *WAL) Batch() (batch *Batch) {
+	wal.truncating.Wait()
 	wal.locker.Lock()
 	batch = &Batch{
 		wal:       wal,
@@ -331,6 +394,7 @@ func (wal *WAL) Batch() (batch *Batch) {
 }
 
 func (wal *WAL) Uncommitted() (n uint64) {
+	wal.truncating.Wait()
 	wal.locker.RLock()
 	n = uint64(wal.uncommitted.Len())
 	wal.locker.RUnlock()
@@ -338,6 +402,7 @@ func (wal *WAL) Uncommitted() (n uint64) {
 }
 
 func (wal *WAL) HasCommitted(index uint64) (ok bool) {
+	wal.truncating.Wait()
 	wal.locker.RLock()
 	_, got := wal.uncommitted.Get(index)
 	ok = !got
@@ -346,6 +411,7 @@ func (wal *WAL) HasCommitted(index uint64) (ok bool) {
 }
 
 func (wal *WAL) OldestUncommitted() (index uint64, has bool) {
+	wal.truncating.Wait()
 	wal.locker.RLock()
 	index, _, has = wal.uncommitted.Min()
 	wal.locker.RUnlock()
@@ -353,14 +419,14 @@ func (wal *WAL) OldestUncommitted() (index uint64, has bool) {
 }
 
 func (wal *WAL) load() (err error) {
-	wal.nextBlockIndex = wal.file.Size() / blockSize
-	if wal.nextBlockIndex == 0 {
+	if wal.file.Size() == 0 {
+		wal.nextBlockPos = 0
 		wal.nextIndex = 0
-		wal.firstIndex = 0
 		return
 	}
+	wal.nextBlockPos = wal.file.Size() / blockSize
 	readBlockIndex := uint64(0)
-	for readBlockIndex < wal.nextBlockIndex {
+	for readBlockIndex < wal.nextBlockPos {
 		pos := readBlockIndex * blockSize
 		entry, readErr := wal.readFromFile(pos)
 		if readErr != nil {
@@ -377,10 +443,6 @@ func (wal *WAL) load() (err error) {
 		}
 		readBlockIndex += uint64(entry.Blocks())
 	}
-	minIndex, _, hasMinIndex := wal.indexes.Min()
-	if hasMinIndex {
-		wal.firstIndex = minIndex
-	}
 	maxIndex, _, hasMaxIndex := wal.indexes.Max()
 	if hasMaxIndex {
 		wal.nextIndex = maxIndex + 1
@@ -390,7 +452,13 @@ func (wal *WAL) load() (err error) {
 
 // CreateSnapshot contains end index
 func (wal *WAL) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
+	wal.truncating.Wait()
 	wal.locker.Lock()
+	if wal.closed {
+		err = ErrClosed
+		wal.locker.Unlock()
+		return
+	}
 	if wal.snapshotting {
 		err = errors.Join(errors.New("wal create snapshot failed"), errors.New("the last snapshot has not been completed"))
 		wal.locker.Unlock()
@@ -473,43 +541,178 @@ func (wal *WAL) closeSnapshotting() {
 	wal.locker.Unlock()
 }
 
-func (wal *WAL) Truncate(endIndex uint64) (err error) {
+// TruncateFront truncate logs before and contains endIndex
+func (wal *WAL) TruncateFront(endIndex uint64) (err error) {
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
-	pos, hasPos := wal.indexes.Get(endIndex)
+	if wal.closed {
+		err = ErrClosed
+		wal.locker.Unlock()
+		return
+	}
+	wal.truncating.Add(1)
+	defer wal.truncating.Done()
+	if wal.snapshotting {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New("can not truncate when making a snapshot"))
+		return
+	}
+	_, hasPos := wal.indexes.Get(endIndex)
 	if !hasPos {
 		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d was not found", endIndex)))
 		return
 	}
-	entry, has, readErr := wal.read(endIndex)
-	if readErr != nil && readErr != ErrInvalidEntry {
-		err = errors.Join(errors.New("wal truncate failed"), readErr)
+	minUnCommittedIndex, _, hasMinUnCommitted := wal.uncommitted.Min()
+	if hasMinUnCommitted && minUnCommittedIndex <= endIndex {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d is greater and equals than min uncommitted index", endIndex)))
 		return
 	}
-	if !has {
-		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d was not found", endIndex)))
+	minIndex, _, hasMinIndex := wal.indexes.Min()
+	if hasMinIndex && minIndex > endIndex {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d is less than min index", endIndex)))
 		return
 	}
-
-	minUncommittedIndex, _, hasUncommittedMin := wal.uncommitted.Min()
-	if hasUncommittedMin && minUncommittedIndex <= endIndex {
-		err = errors.Join(errors.New("wal truncate failed"), errors.New("min uncommitted index is less than end index"))
-		return
-	}
-	firstIndex, _, hasFirst := wal.indexes.Min()
-	if !hasFirst {
-		return
-	}
-	if endIndex < firstIndex {
-		err = errors.Join(errors.New("wal truncate failed"), errors.New("end index is less than first index"))
+	maxIndex, _, hasMaxIndex := wal.indexes.Max()
+	if !hasMaxIndex {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New("there is no max index"))
 		return
 	}
 
-	pos = pos + uint64(len(entry))
+	cleanTmpFn := func(tmpFiles ...*os.File) {
+		for _, tmpFile := range tmpFiles {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFile.Name())
+		}
+	}
+	tmpFilepath := wal.file.Path() + ".truncating"
+	tmpFile, openTmpErr := os.OpenFile(tmpFilepath, os.O_CREATE|os.O_TRUNC|os.O_SYNC|os.O_RDWR, 0640)
+	if openTmpErr != nil {
+		err = errors.Join(errors.New("wal truncate failed"), openTmpErr)
+		return
+	}
+	tmpFullFilepath := wal.file.Path() + ".truncated"
+	tmpFullFile, openFullErr := os.OpenFile(tmpFullFilepath, os.O_CREATE|os.O_TRUNC|os.O_SYNC|os.O_RDWR, 0640)
+	if openFullErr != nil {
+		cleanTmpFn(tmpFile)
+		err = errors.Join(errors.New("wal truncate failed"), openFullErr)
+		return
+	}
+
+	writes := uint64(0)
+	startIndex := endIndex + 1
+	for i := startIndex; i <= maxIndex; i++ {
+		entry, has, readErr := wal.read(i)
+		if readErr != nil && readErr != ErrInvalidEntry {
+			cleanTmpFn(tmpFile, tmpFullFile)
+			err = errors.Join(errors.New("wal truncate failed"), readErr)
+			return
+		}
+		if !has || readErr == ErrInvalidEntry {
+			continue
+		}
+		max := len(entry)
+		n := 0
+		for n < max {
+			nn, writeErr := tmpFile.Write(entry[n:])
+			if writeErr != nil {
+				cleanTmpFn(tmpFile, tmpFullFile)
+				err = errors.Join(errors.New("wal truncate failed"), writeErr)
+				return
+			}
+			n += nn
+		}
+		writes += uint64(max)
+	}
+	syncErr := tmpFile.Sync()
+	if syncErr != nil {
+		cleanTmpFn(tmpFile, tmpFullFile)
+		err = errors.Join(errors.New("wal truncate failed"), syncErr)
+		return
+	}
+
+	_, seekErr := tmpFile.Seek(0, 0)
+	if seekErr != nil {
+		cleanTmpFn(tmpFile, tmpFullFile)
+		err = errors.Join(errors.New("wal truncate failed"), seekErr)
+		return
+	}
+	copied, cpErr := io.Copy(tmpFullFile, tmpFile)
+	if cpErr != nil {
+		cleanTmpFn(tmpFile, tmpFullFile)
+		err = errors.Join(errors.New("wal truncate failed"), cpErr)
+		return
+	}
+
+	if uint64(copied) != writes {
+		cleanTmpFn(tmpFile, tmpFullFile)
+		err = errors.Join(errors.New("wal truncate failed"), errors.New("not copy full"))
+		return
+	}
+	syncFullErr := tmpFullFile.Sync()
+	if syncFullErr != nil {
+		cleanTmpFn(tmpFile, tmpFullFile)
+		err = errors.Join(errors.New("wal truncate failed"), syncFullErr)
+		return
+	}
+	_ = tmpFile.Close()
+	_ = os.Remove(tmpFilepath)
+
+	_ = tmpFullFile.Close()
+
+	originFilepath := wal.file.Path()
+	wal.file.Close()
+
+	_ = os.Remove(originFilepath)
+	renameErr := os.Rename(tmpFullFilepath, originFilepath)
+	if renameErr != nil {
+		err = errors.Join(errors.New("wal truncate failed"), renameErr)
+		return
+	}
+
+	wal.file, err = OpenFile(originFilepath)
+	if err != nil {
+		err = errors.Join(errors.New("wal truncate failed"), renameErr)
+		return
+	}
+
+	for i := minIndex; i <= endIndex; i++ {
+		wal.indexes.Remove(i)
+		wal.cache.Remove(i)
+	}
+	return
+}
+
+// TruncateBack truncate logs after and contains startIndex
+func (wal *WAL) TruncateBack(startIndex uint64) (err error) {
+	wal.locker.Lock()
+	defer wal.locker.Unlock()
+	if wal.closed {
+		err = ErrClosed
+		wal.locker.Unlock()
+		return
+	}
+	wal.truncating.Add(1)
+	defer wal.truncating.Done()
+	if wal.snapshotting {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New("can not truncate when making a snapshot"))
+		return
+	}
+	pos, hasPos := wal.indexes.Get(startIndex)
+	if !hasPos {
+		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d was not found", startIndex)))
+		return
+	}
 	err = wal.file.Truncate(pos)
 	if err != nil {
 		err = errors.Join(errors.New("wal truncate failed"), err)
 		return
+	}
+	endIndex, _, hasEnd := wal.indexes.Max()
+	if !hasEnd {
+		return
+	}
+	for i := startIndex; i <= endIndex; i++ {
+		wal.indexes.Remove(i)
+		wal.cache.Remove(i)
 	}
 	return
 }
