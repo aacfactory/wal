@@ -712,6 +712,7 @@ func (wal *WAL) TruncateBack(startIndex uint64) (err error) {
 	}
 	for i := startIndex; i <= endIndex; i++ {
 		wal.indexes.Remove(i)
+		wal.uncommitted.Remove(i)
 		wal.cache.Remove(i)
 	}
 	return
