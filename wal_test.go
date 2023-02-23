@@ -73,17 +73,33 @@ func TestWAL_Batch(t *testing.T) {
 func TestWAL_OldestUncommitted(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
-	fmt.Println(logs.HasCommitted(1))
 	fmt.Println(logs.Uncommitted())
 	index, has := logs.OldestUncommitted()
 	if !has {
 		fmt.Println("non")
 		return
 	}
-	fmt.Println("uncommitted", index)
-	_ = logs.Commit(index)
+	fmt.Println("uncommitted", index, logs.HasCommitted(index))
+
 }
 
 func TestWAL_CreateSnapshot(t *testing.T) {
+	logs := newWal(t)
+	defer logs.Close()
+	err := logs.CreateSnapshot(&SnapshotSink{})
+	if err != nil {
+		t.Error(err)
+	}
+}
 
+type SnapshotSink struct {
+}
+
+func (s *SnapshotSink) Write(p []byte) (n int, err error) {
+	entries := wal.DecodeEntries(p)
+	for _, entry := range entries {
+		fmt.Println("write:", entry.Index(), string(entry.Data()))
+	}
+	n = len(p)
+	return
 }
