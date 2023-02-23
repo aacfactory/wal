@@ -1,22 +1,22 @@
-package wal
+package lru
 
 import (
 	"container/list"
 )
 
-type LRU struct {
+type LRU[K any, V any] struct {
 	size      int64
 	evictList *list.List
 	items     map[interface{}]*list.Element
 }
 
-type lruItem struct {
-	key   uint64
-	value Entry
+type lruItem[K any, V any] struct {
+	key   K
+	value V
 }
 
-func NewLRU(size uint32) (lru *LRU) {
-	lru = &LRU{
+func New[K any, V any](size uint32) (lru *LRU[K, V]) {
+	lru = &LRU[K, V]{
 		size:      int64(size),
 		evictList: list.New(),
 		items:     make(map[interface{}]*list.Element),
@@ -24,21 +24,21 @@ func NewLRU(size uint32) (lru *LRU) {
 	return
 }
 
-func (c *LRU) Purge() {
+func (c *LRU[K, V]) Purge() {
 	for k := range c.items {
 		delete(c.items, k)
 	}
 	c.evictList.Init()
 }
 
-func (c *LRU) Add(key uint64, value Entry) (evicted bool) {
+func (c *LRU[K, V]) Add(key K, value V) (evicted bool) {
 	if ent, ok := c.items[key]; ok {
 		c.evictList.MoveToFront(ent)
-		ent.Value.(*lruItem).value = value
+		ent.Value.(*lruItem[K, V]).value = value
 		return
 	}
 
-	ent := &lruItem{key, value}
+	ent := &lruItem[K, V]{key, value}
 	c.items[key] = c.evictList.PushFront(ent)
 
 	evicted = int64(c.evictList.Len()) > c.size
@@ -48,20 +48,20 @@ func (c *LRU) Add(key uint64, value Entry) (evicted bool) {
 	return
 }
 
-func (c *LRU) Get(key uint64) (value Entry, ok bool) {
+func (c *LRU[K, V]) Get(key K) (value V, ok bool) {
 	if ent, has := c.items[key]; has {
 		c.evictList.MoveToFront(ent)
-		if ent.Value.(*lruItem) == nil {
+		if ent.Value.(*lruItem[K, V]) == nil {
 			return
 		}
 		ok = true
-		value = ent.Value.(*lruItem).value
+		value = ent.Value.(*lruItem[K, V]).value
 		return
 	}
 	return
 }
 
-func (c *LRU) Remove(key uint64) (present bool) {
+func (c *LRU[K, V]) Remove(key K) (present bool) {
 	if ent, ok := c.items[key]; ok {
 		c.removeElement(ent)
 		present = true
@@ -70,21 +70,21 @@ func (c *LRU) Remove(key uint64) (present bool) {
 	return
 }
 
-func (c *LRU) Keys() []uint64 {
-	keys := make([]uint64, len(c.items))
+func (c *LRU[K, V]) Keys() []K {
+	keys := make([]K, len(c.items))
 	i := 0
 	for ent := c.evictList.Back(); ent != nil; ent = ent.Prev() {
-		keys[i] = ent.Value.(*lruItem).key
+		keys[i] = ent.Value.(*lruItem[K, V]).key
 		i++
 	}
 	return keys
 }
 
-func (c *LRU) Len() int {
+func (c *LRU[K, V]) Len() int {
 	return c.evictList.Len()
 }
 
-func (c *LRU) Resize(size int64) (evicted int64) {
+func (c *LRU[K, V]) Resize(size int64) (evicted int64) {
 	evicted = int64(c.Len()) - size
 	if evicted < 0 {
 		evicted = 0
@@ -96,15 +96,15 @@ func (c *LRU) Resize(size int64) (evicted int64) {
 	return
 }
 
-func (c *LRU) removeOldest() {
+func (c *LRU[K, V]) removeOldest() {
 	ent := c.evictList.Back()
 	if ent != nil {
 		c.removeElement(ent)
 	}
 }
 
-func (c *LRU) removeElement(e *list.Element) {
+func (c *LRU[K, V]) removeElement(e *list.Element) {
 	c.evictList.Remove(e)
-	kv := e.Value.(*lruItem)
+	kv := e.Value.(*lruItem[K, V])
 	delete(c.items, kv.key)
 }
