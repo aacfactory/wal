@@ -11,9 +11,9 @@ type Batch struct {
 	released  bool
 }
 
-func (batch *Batch) Write(p []byte) (index uint64) {
+func (batch *Batch) Write(key []byte, p []byte) (index uint64) {
 	index = batch.nextIndex
-	entry := NewEntry(index, p)
+	entry := NewEntry(index, key, p)
 	batch.data = append(batch.data, entry...)
 	batch.nextIndex++
 	return
