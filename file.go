@@ -97,10 +97,28 @@ func (f *File) Truncate(end uint64) (err error) {
 	return
 }
 
+func (f *File) Path() (path string) {
+	path = f.file.Name()
+	return
+}
+
 func (f *File) Close() {
 	f.locker.Lock()
 	_ = f.file.Sync()
 	_ = f.file.Close()
 	f.locker.Unlock()
+	return
+}
+
+func ExistFile(filePath string) (ok bool) {
+	_, err := os.Stat(filePath)
+	if err == nil {
+		ok = true
+		return
+	}
+	if os.IsNotExist(err) {
+		return
+	}
+	ok = true
 	return
 }
