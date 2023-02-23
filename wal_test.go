@@ -23,7 +23,7 @@ func TestWAL_Write(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
 	for i := 0; i < 10; i++ {
-		index, writeErr := logs.Write([]byte(time.Now().Format(time.RFC3339)))
+		index, writeErr := logs.Write([]byte(fmt.Sprintf("%d", i)), []byte(time.Now().Format(time.RFC3339)))
 		if writeErr != nil {
 			t.Error(i, "write", writeErr)
 			return
@@ -47,12 +47,12 @@ func TestWAL_Read(t *testing.T) {
 	}
 	fmt.Println(lastIndex)
 	for i := uint64(0); i < lastIndex; i++ {
-		p, state, readErr := logs.Read(i)
+		key, p, state, readErr := logs.Read(i)
 		if readErr != nil {
 			t.Error(i, "read:", readErr)
 			continue
 		}
-		fmt.Println(i, "read:", state, string(p))
+		fmt.Println(i, "read:", string(key), state, string(p))
 	}
 	fmt.Println(logs.UncommittedSize())
 }
@@ -64,7 +64,7 @@ func TestWAL_Batch(t *testing.T) {
 	defer batch.Close()
 	indexes := make([]uint64, 0, 1)
 	for i := 0; i < 3; i++ {
-		indexes = append(indexes, batch.Write([]byte(time.Now().Format(time.RFC3339))))
+		indexes = append(indexes, batch.Write([]byte(fmt.Sprintf("%d", i)), []byte(time.Now().Format(time.RFC3339))))
 	}
 	fmt.Println(batch.Flush())
 	fmt.Println(logs.Commit(indexes...))
@@ -97,7 +97,8 @@ type SnapshotSink struct {
 func (s *SnapshotSink) Write(p []byte) (n int, err error) {
 	entries := wal.DecodeEntries(p)
 	for _, entry := range entries {
-		fmt.Println("write:", entry.Index(), string(entry.Data()))
+		key, p := entry.Data()
+		fmt.Println("write:", entry.Index(), string(key), string(p))
 	}
 	n = len(p)
 	return
@@ -124,4 +125,11 @@ func TestWAL_FirstIndex(t *testing.T) {
 	fmt.Println(logs.FirstIndex())
 	fmt.Println(logs.LastIndex())
 	fmt.Println(logs.Len())
+}
+
+func TestWAL_Key(t *testing.T) {
+	logs := newWal(t)
+	defer logs.Close()
+	p, has, err := logs.Key([]byte("-1"))
+	fmt.Println(has, string(p), err)
 }

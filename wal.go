@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/aacfactory/wal/btree"
 	"github.com/aacfactory/wal/lru"
+	"github.com/cespare/xxhash/v2"
 	"github.com/valyala/bytebufferpool"
 	"io"
 	"os"
@@ -17,10 +18,11 @@ var (
 	ErrClosed       = errors.New("wal was closed")
 	ErrNoFirstIndex = errors.New("wal has no first index")
 	ErrNoLastIndex  = errors.New("wal has no last index")
+	ErrNotFound     = errors.New("not found")
 )
 
 const (
-	UncommittedState = State(iota)
+	UncommittedState = State(iota + 1)
 	CommittedState
 	DiscardedState
 )
@@ -79,6 +81,7 @@ func NewWithCacheSize(path string, cacheSize uint32) (wal *WAL, err error) {
 	wal = &WAL{
 		locker:       sync.RWMutex{},
 		indexes:      btree.New[uint64, uint64](),
+		keys:         btree.New[uint64, uint64](),
 		cache:        lru.New[uint64, Entry](cacheSize),
 		file:         file,
 		nextIndex:    0,
@@ -95,6 +98,7 @@ func NewWithCacheSize(path string, cacheSize uint32) (wal *WAL, err error) {
 type WAL struct {
 	locker       sync.RWMutex
 	indexes      *btree.BTree[uint64, uint64]
+	keys         *btree.BTree[uint64, uint64]
 	cache        *lru.LRU[uint64, Entry]
 	file         *File
 	nextIndex    uint64
@@ -147,7 +151,7 @@ func (wal *WAL) Len() (n uint64) {
 	return
 }
 
-func (wal *WAL) Read(index uint64) (p []byte, state State, err error) {
+func (wal *WAL) Read(index uint64) (key []byte, p []byte, state State, err error) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
 	if wal.closed {
@@ -162,20 +166,38 @@ func (wal *WAL) Read(index uint64) (p []byte, state State, err error) {
 		return
 	}
 	if !got {
+		err = ErrNotFound
 		return
 	}
-	p = entry.Data()
-	if entry.Committed() {
-		state = CommittedState
-	} else if entry.Discarded() {
-		state = DiscardedState
-	} else {
-		state = UncommittedState
-	}
+	key, p = entry.Data()
+	state = State(entry.State())
 	return
 }
 
-func (wal *WAL) Write(p []byte) (index uint64, err error) {
+func (wal *WAL) Key(key []byte) (p []byte, state State, err error) {
+	wal.truncating.Wait()
+	wal.locker.RLock()
+	if wal.closed {
+		err = ErrClosed
+		wal.locker.RUnlock()
+		return
+	}
+	entry, got, readErr := wal.readByKey(key)
+	wal.locker.RUnlock()
+	if readErr != nil {
+		err = readErr
+		return
+	}
+	if !got {
+		err = ErrNotFound
+		return
+	}
+	_, p = entry.Data()
+	state = State(entry.State())
+	return
+}
+
+func (wal *WAL) Write(key []byte, p []byte) (index uint64, err error) {
 	wal.truncating.Wait()
 	wal.locker.Lock()
 	if wal.closed {
@@ -184,7 +206,7 @@ func (wal *WAL) Write(p []byte) (index uint64, err error) {
 		return
 	}
 	index = wal.nextIndex
-	entry := NewEntry(index, p)
+	entry := NewEntry(index, key, p)
 	writeErr := wal.file.WriteAt(entry, wal.acquireNextBlockPos())
 	if writeErr != nil {
 		err = errors.Join(errors.New("wal write failed"), writeErr)
@@ -207,8 +229,18 @@ func (wal *WAL) mountUncommitted(entry Entry) {
 	wal.cache.Add(index, entry)
 	wal.indexes.Set(index, pos)
 	wal.uncommitted.Set(index, pos)
+	wal.keys.Set(xxhash.Sum64(entry.Key()), index)
 	wal.nextIndex++
 	wal.nextBlockPos += uint64(entry.Blocks())
+	return
+}
+
+func (wal *WAL) readByKey(key []byte) (entry Entry, has bool, err error) {
+	index, got := wal.keys.Get(xxhash.Sum64(key))
+	if !got {
+		return
+	}
+	entry, has, err = wal.read(index)
 	return
 }
 
@@ -509,6 +541,7 @@ func (wal *WAL) load() (err error) {
 		if !entry.Finished() {
 			wal.uncommitted.Set(index, pos)
 		}
+		wal.keys.Set(xxhash.Sum64(entry.Key()), index)
 		readBlockIndex += uint64(entry.Blocks())
 	}
 	maxIndex, _, hasMaxIndex := wal.indexes.Max()
@@ -743,6 +776,10 @@ func (wal *WAL) TruncateFront(endIndex uint64) (err error) {
 	}
 
 	for i := minIndex; i <= endIndex; i++ {
+		entry, has, _ := wal.read(i)
+		if has {
+			wal.keys.Remove(xxhash.Sum64(entry.Key()))
+		}
 		wal.indexes.Remove(i)
 		wal.cache.Remove(i)
 	}
@@ -779,6 +816,10 @@ func (wal *WAL) TruncateBack(startIndex uint64) (err error) {
 		return
 	}
 	for i := startIndex; i <= endIndex; i++ {
+		entry, has, _ := wal.read(i)
+		if has {
+			wal.keys.Remove(xxhash.Sum64(entry.Key()))
+		}
 		wal.indexes.Remove(i)
 		wal.uncommitted.Remove(i)
 		wal.cache.Remove(i)
