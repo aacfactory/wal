@@ -427,6 +427,46 @@ func (wal *WAL[K]) readFromFile(pos uint64) (entry Entry, err error) {
 	return
 }
 
+func (wal *WAL[K]) CommitKey(keys ...K) (err error) {
+	wal.truncating.Wait()
+	if keys == nil || len(keys) == 0 {
+		return
+	}
+	wal.locker.Lock()
+	if wal.closed {
+		err = ErrClosed
+		wal.locker.Unlock()
+		return
+	}
+	if wal.uncommitted.Len() == 0 {
+		err = errors.Join(errors.New("wal commit log failed"), errors.New("there is no uncommitted"))
+		wal.locker.Unlock()
+		return
+	}
+	indexes := make([]uint64, 0, len(keys))
+	for _, key := range keys {
+		index, has := wal.keys.Get(key)
+		if !has {
+			err = ErrNotFound
+			wal.locker.Unlock()
+			return
+		}
+		indexes = append(indexes, index)
+	}
+	if len(indexes) == 1 {
+		err = wal.commitOrDiscard(indexes[0], false)
+	} else {
+		err = wal.commitOrDiscardBatch(indexes, false)
+	}
+	if err != nil {
+		if err != ErrNotFound {
+			err = errors.Join(errors.New("wal commit log failed"), err)
+		}
+	}
+	wal.locker.Unlock()
+	return
+}
+
 func (wal *WAL[K]) Commit(indexes ...uint64) (err error) {
 	wal.truncating.Wait()
 	if indexes == nil || len(indexes) == 0 {
@@ -451,6 +491,46 @@ func (wal *WAL[K]) Commit(indexes ...uint64) (err error) {
 	if err != nil {
 		if err != ErrNotFound {
 			err = errors.Join(errors.New("wal commit log failed"), err)
+		}
+	}
+	wal.locker.Unlock()
+	return
+}
+
+func (wal *WAL[K]) DiscardKey(keys ...K) (err error) {
+	wal.truncating.Wait()
+	if keys == nil || len(keys) == 0 {
+		return
+	}
+	wal.locker.Lock()
+	if wal.closed {
+		err = ErrClosed
+		wal.locker.Unlock()
+		return
+	}
+	if wal.uncommitted.Len() == 0 {
+		err = errors.Join(errors.New("wal discard log failed"), errors.New("there is no uncommitted"))
+		wal.locker.Unlock()
+		return
+	}
+	indexes := make([]uint64, 0, len(keys))
+	for _, key := range keys {
+		index, has := wal.keys.Get(key)
+		if !has {
+			err = ErrNotFound
+			wal.locker.Unlock()
+			return
+		}
+		indexes = append(indexes, index)
+	}
+	if len(indexes) == 1 {
+		err = wal.commitOrDiscard(indexes[0], true)
+	} else {
+		err = wal.commitOrDiscardBatch(indexes, true)
+	}
+	if err != nil {
+		if err != ErrNotFound {
+			err = errors.Join(errors.New("wal discard log failed"), err)
 		}
 	}
 	wal.locker.Unlock()
