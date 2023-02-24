@@ -3,6 +3,8 @@ Write ahead log for Go.
 
 ## Features
 * transaction
+* * when transaction was disabled, then `Commit` func is disabled.
+* * when transaction was enabled and level is `ReadCommitted`, get any uncommitted entry will return not found error. 
 * snapshot
 * batch writer
 * support key
