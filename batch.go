@@ -18,10 +18,13 @@ func (batch *Batch[K]) Write(key K, p []byte) (index uint64, err error) {
 		return
 	}
 
-	if batch.wal.getUncommittedKey(key) {
-		err = errors.Join(errors.New("batch write failed"), errors.New("prev key was not committed or discarded"))
-		batch.release()
-		return
+	if batch.wal.transactionEnabled {
+		_, has := batch.wal.uncommittedKeys.Get(key)
+		if has {
+			err = errors.Join(errors.New("batch write failed"), errors.New("prev key was not committed or discarded"))
+			batch.release()
+			return
+		}
 	}
 
 	kp, encodeErr := batch.wal.keyEncoder.Encode(key)
@@ -32,6 +35,9 @@ func (batch *Batch[K]) Write(key K, p []byte) (index uint64, err error) {
 	}
 	index = batch.nextIndex
 	entry := NewEntry(index, kp, p)
+	if !batch.wal.transactionEnabled {
+		entry.Commit()
+	}
 	batch.keys = append(batch.keys, key)
 	batch.data = append(batch.data, entry...)
 	batch.nextIndex++
@@ -47,14 +53,20 @@ func (batch *Batch[K]) Flush() (err error) {
 		err = ErrClosed
 		return
 	}
-	writeErr := batch.wal.file.WriteAt(batch.data, batch.wal.acquireNextBlockPos())
+	pos := batch.wal.acquireNextBlockPos()
+	writeErr := batch.wal.file.WriteAt(batch.data, pos)
 	if writeErr != nil {
 		err = errors.Join(errors.New("flush batch wrote failed"), writeErr)
 		return
 	}
 	entries := DecodeEntries(batch.data)
 	for i, entry := range entries {
-		batch.wal.mountUncommitted(batch.keys[i], entry)
+		if !batch.wal.transactionEnabled {
+			batch.wal.mountWriteCommitted(batch.keys[i], entry, pos)
+		} else {
+			batch.wal.mountWriteUncommitted(batch.keys[i], entry, pos)
+		}
+		pos = pos + uint64(entry.Blocks()*blockSize)
 	}
 	return
 }
@@ -76,5 +88,6 @@ func (batch *Batch[K]) release() {
 	batch.released = true
 	batch.keys = batch.keys[:]
 	batch.data = batch.data[:]
+	batch.nextIndex = 0
 	batch.wal.locker.Unlock()
 }

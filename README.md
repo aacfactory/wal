@@ -15,7 +15,7 @@ go get github.com/aacfactory/wal
 ## Usage
 ```go
 // create
-logs, createErr := wal.New[uint64](`file path`, wal.Unit64KeyEncoder())
+logs, createErr := wal.New[uint64](`file path`, wal.Unit64KeyEncoder(), wal.EnableTransaction(wal.ReadUncommitted))
 // write, it will return the index of log
 index, writeErr := logs.Write(1, []byte("some content"))
 // read 

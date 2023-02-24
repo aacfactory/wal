@@ -13,11 +13,12 @@ import (
 )
 
 var (
-	ErrInvalidEntry = errors.New("invalid entry")
-	ErrClosed       = errors.New("wal was closed")
-	ErrNoFirstIndex = errors.New("wal has no first index")
-	ErrNoLastIndex  = errors.New("wal has no last index")
-	ErrNotFound     = errors.New("not found")
+	ErrInvalidEntry         = errors.New("invalid entry")
+	ErrClosed               = errors.New("wal was closed")
+	ErrNoFirstIndex         = errors.New("wal has no first index")
+	ErrNoLastIndex          = errors.New("wal has no last index")
+	ErrNotFound             = errors.New("not found")
+	ErrCommittedOrDiscarded = errors.New("entry was committed or discarded")
 )
 
 const (
@@ -41,15 +42,68 @@ func (state State) String() string {
 	}
 }
 
-func New[K ordered](path string, keyEncoder KeyEncoder[K]) (wal *WAL[K], err error) {
-	wal, err = NewWithCacheSize[K](path, keyEncoder, 10240)
-	return
+const (
+	ReadCommitted = TransactionLevel(iota + 1)
+	ReadUncommitted
+)
+
+type TransactionLevel int
+
+func (level TransactionLevel) String() string {
+	switch level {
+	case ReadCommitted:
+		return "read_committed"
+	case ReadUncommitted:
+		return "read_uncommitted"
+	default:
+		return fmt.Sprintf("Unknown(%d)", level)
+	}
 }
 
-func NewWithCacheSize[K ordered](path string, keyEncoder KeyEncoder[K], cacheSize uint32) (wal *WAL[K], err error) {
+type Option func(options *Options)
+
+func WithCacheSize(size int) Option {
+	return func(options *Options) {
+		options.CacheSize = size
+	}
+}
+
+func EnableTransaction(level TransactionLevel) Option {
+	return func(options *Options) {
+		options.TransactionEnabled = true
+		options.TransactionLevel = level
+	}
+}
+
+type Options struct {
+	CacheSize          int
+	TransactionEnabled bool
+	TransactionLevel   TransactionLevel
+}
+
+func New[K ordered](path string, keyEncoder KeyEncoder[K], options ...Option) (wal *WAL[K], err error) {
 	if keyEncoder == nil {
 		err = errors.Join(errors.New("create wal failed"), errors.New("key encoder is required"))
 		return
+	}
+	opt := &Options{
+		CacheSize:          8196,
+		TransactionEnabled: false,
+		TransactionLevel:   TransactionLevel(0),
+	}
+	if options != nil && len(options) > 0 {
+		for _, option := range options {
+			option(opt)
+		}
+	}
+	if opt.CacheSize < 1 {
+		opt.CacheSize = 8196
+	}
+	if opt.TransactionEnabled {
+		if opt.TransactionLevel != ReadUncommitted && opt.TransactionLevel != ReadCommitted {
+			err = errors.Join(errors.New("create wal failed"), errors.New("invalid transaction level"))
+			return
+		}
 	}
 	file, openErr := OpenFile(path)
 	if openErr != nil {
@@ -78,40 +132,44 @@ func NewWithCacheSize[K ordered](path string, keyEncoder KeyEncoder[K], cacheSiz
 			return
 		}
 	}
-	if cacheSize == 0 {
-		cacheSize = 1024
-	}
+
 	wal = &WAL[K]{
-		locker:       sync.RWMutex{},
-		indexes:      btree.New[uint64, uint64](),
-		keys:         btree.New[K, uint64](),
-		keyEncoder:   keyEncoder,
-		cache:        lru.New[uint64, Entry](cacheSize),
-		file:         file,
-		nextIndex:    0,
-		nextBlockPos: 0,
-		uncommitted:  btree.New[uint64, uint64](),
-		closed:       false,
-		snapshotting: false,
-		truncating:   sync.WaitGroup{},
+		locker:             sync.RWMutex{},
+		transactionEnabled: opt.TransactionEnabled,
+		transactionLevel:   opt.TransactionLevel,
+		indexes:            btree.New[uint64, uint64](),
+		uncommittedIndexes: btree.New[uint64, uint64](),
+		keys:               btree.New[K, uint64](),
+		uncommittedKeys:    btree.New[K, uint64](),
+		keyEncoder:         keyEncoder,
+		cache:              lru.New[uint64, Entry](uint32(opt.CacheSize)),
+		file:               file,
+		nextIndex:          0,
+		nextBlockPos:       0,
+		closed:             false,
+		snapshotting:       false,
+		truncating:         sync.WaitGroup{},
 	}
 	err = wal.load()
 	return
 }
 
 type WAL[K ordered] struct {
-	locker       sync.RWMutex
-	indexes      *btree.BTree[uint64, uint64]
-	keys         *btree.BTree[K, uint64]
-	keyEncoder   KeyEncoder[K]
-	cache        *lru.LRU[uint64, Entry]
-	file         *File
-	nextIndex    uint64
-	nextBlockPos uint64
-	uncommitted  *btree.BTree[uint64, uint64]
-	snapshotting bool
-	truncating   sync.WaitGroup
-	closed       bool
+	locker             sync.RWMutex
+	transactionEnabled bool
+	transactionLevel   TransactionLevel
+	indexes            *btree.BTree[uint64, uint64]
+	uncommittedIndexes *btree.BTree[uint64, uint64]
+	keys               *btree.BTree[K, uint64]
+	uncommittedKeys    *btree.BTree[K, uint64]
+	keyEncoder         KeyEncoder[K]
+	cache              *lru.LRU[uint64, Entry]
+	file               *File
+	nextIndex          uint64
+	nextBlockPos       uint64
+	snapshotting       bool
+	truncating         sync.WaitGroup
+	closed             bool
 }
 
 func (wal *WAL[K]) FirstIndex() (idx uint64, err error) {
@@ -186,6 +244,9 @@ func (wal *WAL[K]) Len() (n uint64) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
 	n = uint64(wal.indexes.Len())
+	if wal.transactionEnabled && wal.transactionLevel == ReadUncommitted {
+		n = n + uint64(wal.uncommittedIndexes.Len())
+	}
 	wal.locker.RUnlock()
 	return
 }
@@ -198,7 +259,7 @@ func (wal *WAL[K]) Read(index uint64) (key K, p []byte, state State, err error) 
 		wal.locker.RUnlock()
 		return
 	}
-	entry, _, got, readErr := wal.read(index)
+	entry, _, got, readErr := wal.readWithTransaction(index)
 	wal.locker.RUnlock()
 	if readErr != nil {
 		err = readErr
@@ -212,6 +273,7 @@ func (wal *WAL[K]) Read(index uint64) (key K, p []byte, state State, err error) 
 	k, data := entry.Data()
 	key, err = wal.keyEncoder.Decode(k)
 	if err != nil {
+		err = errors.Join(errors.New("wal read failed"), err)
 		return
 	}
 	p = data
@@ -251,27 +313,37 @@ func (wal *WAL[K]) Write(key K, p []byte) (index uint64, err error) {
 	}
 	wal.truncating.Wait()
 	wal.locker.Lock()
+	defer wal.locker.Unlock()
 	if wal.closed {
 		err = ErrClosed
-		wal.locker.Unlock()
 		return
 	}
-	if wal.getUncommittedKey(key) {
-		err = errors.Join(errors.New("wal write failed"), errors.New("prev key was not committed or discarded"))
-		wal.locker.Unlock()
-		return
+	if wal.transactionEnabled {
+		_, hasUncommitted := wal.uncommittedKeys.Get(key)
+		if hasUncommitted {
+			err = errors.Join(errors.New("wal write failed"), errors.New("prev key was not committed or discarded"))
+			return
+		}
 	}
 
 	index = wal.nextIndex
 	entry := NewEntry(index, k, p)
-	writeErr := wal.file.WriteAt(entry, wal.acquireNextBlockPos())
+	if !wal.transactionEnabled {
+		entry.Commit()
+	}
+	pos := wal.acquireNextBlockPos()
+	writeErr := wal.file.WriteAt(entry, pos)
 	if writeErr != nil {
 		err = errors.Join(errors.New("wal write failed"), writeErr)
-		wal.locker.Unlock()
 		return
 	}
-	wal.mountUncommitted(key, entry)
-	wal.locker.Unlock()
+	if !wal.transactionEnabled {
+		wal.mountWriteCommitted(key, entry, pos)
+	} else {
+		wal.mountWriteUncommitted(key, entry, pos)
+	}
+	wal.incrNextIndexAndBlockPos(entry)
+	//wal.cache.Add(index, entry)
 	return
 }
 
@@ -285,7 +357,10 @@ func (wal *WAL[K]) RemoveKey(key K) (err error) {
 	}
 	index, has := wal.keys.Get(key)
 	if !has {
-		return
+		index, has = wal.uncommittedKeys.Get(key)
+		if !has {
+			return
+		}
 	}
 	err = wal.remove(index)
 	return
@@ -303,41 +378,41 @@ func (wal *WAL[K]) Remove(index uint64) (err error) {
 	return
 }
 
-func (wal *WAL[K]) remove(idx uint64) (err error) {
-	entry, pos, has, readErr := wal.read(idx)
+func (wal *WAL[K]) remove(index uint64) (err error) {
+	pos, has := wal.indexes.Get(index)
+	if !has {
+		pos, has = wal.uncommittedIndexes.Get(index)
+		if !has {
+			err = errors.Join(errors.New("wal remove failed"), ErrNotFound)
+			return
+		}
+	}
+	entry, readErr := wal.read(index)
 	if readErr != nil {
 		err = errors.Join(errors.New("wal remove failed"), readErr)
 		return
 	}
-	if !has {
-		return
-	}
+
 	key, decodeErr := wal.keyEncoder.Decode(entry.Key())
 	if decodeErr != nil {
 		err = errors.Join(errors.New("wal remove failed"), decodeErr)
 		return
 	}
 
-	if entry.Removed() {
-		wal.cache.Remove(idx)
-		wal.indexes.Remove(idx)
-		wal.uncommitted.Remove(idx)
-		wal.keys.Remove(key)
-		return
+	if !entry.Removed() {
+		entry.Remove()
+		err = wal.file.WriteAt(entry, pos)
+		if err != nil {
+			err = errors.Join(errors.New("wal remove failed"), err)
+			return
+		}
 	}
 
-	entry.Remove()
-
-	err = wal.file.WriteAt(entry, pos)
-	if err != nil {
-		err = errors.Join(errors.New("wal remove failed"), err)
-		return
-	}
-
-	wal.cache.Remove(idx)
-	wal.indexes.Remove(idx)
-	wal.uncommitted.Remove(idx)
+	wal.cache.Remove(index)
+	wal.indexes.Remove(index)
+	wal.uncommittedIndexes.Remove(index)
 	wal.keys.Remove(key)
+	wal.uncommittedKeys.Remove(key)
 	return
 }
 
@@ -346,41 +421,56 @@ func (wal *WAL[K]) acquireNextBlockPos() (pos uint64) {
 	return
 }
 
-func (wal *WAL[K]) mountUncommitted(key K, entry Entry) {
-	index := entry.Index()
-	pos := wal.acquireNextBlockPos()
-	wal.cache.Add(index, entry)
-	wal.indexes.Set(index, pos)
-	wal.uncommitted.Set(index, pos)
-	wal.keys.Set(key, index)
+func (wal *WAL[K]) incrNextIndexAndBlockPos(entry Entry) {
 	wal.nextIndex++
 	wal.nextBlockPos += uint64(entry.Blocks())
+	return
+}
+
+func (wal *WAL[K]) mountWriteCommitted(key K, entry Entry, pos uint64) {
+	index := entry.Index()
+	wal.indexes.Set(index, pos)
+	wal.keys.Set(key, index)
+	wal.cache.Add(index, entry)
+}
+
+func (wal *WAL[K]) mountWriteUncommitted(key K, entry Entry, pos uint64) {
+	index := entry.Index()
+	wal.uncommittedIndexes.Set(index, pos)
+	wal.uncommittedKeys.Set(key, index)
+	wal.cache.Add(index, entry)
 	return
 }
 
 func (wal *WAL[K]) readByKey(key K) (entry Entry, pos uint64, has bool, err error) {
 	index, got := wal.keys.Get(key)
 	if !got {
-		return
+		if wal.transactionEnabled && wal.transactionLevel == ReadUncommitted {
+			index, got = wal.uncommittedKeys.Get(key)
+			if !got {
+				return
+			}
+		} else {
+			return
+		}
 	}
-	entry, pos, has, err = wal.read(index)
+	entry, pos, has, err = wal.readWithTransaction(index)
 	return
 }
 
-func (wal *WAL[K]) read(index uint64) (entry Entry, pos uint64, has bool, err error) {
+func (wal *WAL[K]) readWithTransaction(index uint64) (entry Entry, pos uint64, has bool, err error) {
 	pos, has = wal.indexes.Get(index)
 	if !has {
-		return
-	}
-	entry, has = wal.cache.Get(index)
-	if has {
-		if !entry.Validate() {
-			err = ErrInvalidEntry
+		if wal.transactionEnabled && wal.transactionLevel == ReadUncommitted {
+			pos, has = wal.uncommittedIndexes.Get(index)
+			if !has {
+				return
+			}
+		} else {
 			return
 		}
-		return
 	}
-	entry, err = wal.readFromFile(pos)
+	entry, err = wal.readFromDisk(pos)
 	if err != nil {
 		switch err {
 		case ErrNotFound, ErrInvalidEntry:
@@ -391,11 +481,32 @@ func (wal *WAL[K]) read(index uint64) (entry Entry, pos uint64, has bool, err er
 		}
 	}
 	has = true
+	return
+}
+
+func (wal *WAL[K]) read(index uint64) (entry Entry, err error) {
+	has := false
+	entry, has = wal.cache.Get(index)
+	if has {
+		return
+	}
+	pos, hasPos := wal.indexes.Get(index)
+	if !hasPos {
+		pos, hasPos = wal.uncommittedIndexes.Get(index)
+		if !hasPos {
+			err = ErrNotFound
+			return
+		}
+	}
+	entry, err = wal.readFromDisk(pos)
+	if err != nil {
+		return
+	}
 	wal.cache.Add(index, entry)
 	return
 }
 
-func (wal *WAL[K]) readFromFile(pos uint64) (entry Entry, err error) {
+func (wal *WAL[K]) readFromDisk(pos uint64) (entry Entry, err error) {
 	block := NewBlock()
 	readErr := wal.file.ReadAt(block, pos)
 	if readErr != nil {
@@ -427,37 +538,41 @@ func (wal *WAL[K]) readFromFile(pos uint64) (entry Entry, err error) {
 	}
 	if !entry.Validate() {
 		err = ErrInvalidEntry
+		wal.cache.Remove(entry.Index())
 		return
 	}
 	if entry.Removed() {
 		err = ErrNotFound
+		wal.cache.Remove(entry.Index())
 		return
 	}
 	return
 }
 
 func (wal *WAL[K]) CommitKey(keys ...K) (err error) {
-	wal.truncating.Wait()
+	if !wal.transactionEnabled {
+		err = errors.Join(errors.New("wal commit log failed"), errors.New("transaction mode is disabled"))
+		return
+	}
 	if keys == nil || len(keys) == 0 {
 		return
 	}
+	wal.truncating.Wait()
 	wal.locker.Lock()
+	defer wal.locker.Unlock()
 	if wal.closed {
 		err = ErrClosed
-		wal.locker.Unlock()
 		return
 	}
-	if wal.uncommitted.Len() == 0 {
+	if wal.uncommittedKeys.Len() == 0 {
 		err = errors.Join(errors.New("wal commit log failed"), errors.New("there is no uncommitted"))
-		wal.locker.Unlock()
 		return
 	}
 	indexes := make([]uint64, 0, len(keys))
 	for _, key := range keys {
-		index, has := wal.keys.Get(key)
+		index, has := wal.uncommittedKeys.Get(key)
 		if !has {
 			err = ErrNotFound
-			wal.locker.Unlock()
 			return
 		}
 		indexes = append(indexes, index)
@@ -472,24 +587,26 @@ func (wal *WAL[K]) CommitKey(keys ...K) (err error) {
 			err = errors.Join(errors.New("wal commit log failed"), err)
 		}
 	}
-	wal.locker.Unlock()
 	return
 }
 
 func (wal *WAL[K]) Commit(indexes ...uint64) (err error) {
-	wal.truncating.Wait()
+	if !wal.transactionEnabled {
+		err = errors.Join(errors.New("wal commit log failed"), errors.New("transaction mode is disabled"))
+		return
+	}
 	if indexes == nil || len(indexes) == 0 {
 		return
 	}
+	wal.truncating.Wait()
 	wal.locker.Lock()
+	defer wal.locker.Unlock()
 	if wal.closed {
 		err = ErrClosed
-		wal.locker.Unlock()
 		return
 	}
-	if wal.uncommitted.Len() == 0 {
+	if wal.uncommittedIndexes.Len() == 0 {
 		err = errors.Join(errors.New("wal commit log failed"), errors.New("there is no uncommitted"))
-		wal.locker.Unlock()
 		return
 	}
 	if len(indexes) == 1 {
@@ -502,32 +619,33 @@ func (wal *WAL[K]) Commit(indexes ...uint64) (err error) {
 			err = errors.Join(errors.New("wal commit log failed"), err)
 		}
 	}
-	wal.locker.Unlock()
 	return
 }
 
 func (wal *WAL[K]) DiscardKey(keys ...K) (err error) {
-	wal.truncating.Wait()
+	if !wal.transactionEnabled {
+		err = errors.Join(errors.New("wal discard log failed"), errors.New("transaction mode is disabled"))
+		return
+	}
 	if keys == nil || len(keys) == 0 {
 		return
 	}
+	wal.truncating.Wait()
 	wal.locker.Lock()
+	defer wal.locker.Unlock()
 	if wal.closed {
 		err = ErrClosed
-		wal.locker.Unlock()
 		return
 	}
-	if wal.uncommitted.Len() == 0 {
+	if wal.uncommittedKeys.Len() == 0 {
 		err = errors.Join(errors.New("wal discard log failed"), errors.New("there is no uncommitted"))
-		wal.locker.Unlock()
 		return
 	}
 	indexes := make([]uint64, 0, len(keys))
 	for _, key := range keys {
-		index, has := wal.keys.Get(key)
+		index, has := wal.uncommittedKeys.Get(key)
 		if !has {
 			err = ErrNotFound
-			wal.locker.Unlock()
 			return
 		}
 		indexes = append(indexes, index)
@@ -542,24 +660,26 @@ func (wal *WAL[K]) DiscardKey(keys ...K) (err error) {
 			err = errors.Join(errors.New("wal discard log failed"), err)
 		}
 	}
-	wal.locker.Unlock()
 	return
 }
 
 func (wal *WAL[K]) Discard(indexes ...uint64) (err error) {
-	wal.truncating.Wait()
+	if !wal.transactionEnabled {
+		err = errors.Join(errors.New("wal discard log failed"), errors.New("transaction mode is disabled"))
+		return
+	}
 	if indexes == nil || len(indexes) == 0 {
 		return
 	}
+	wal.truncating.Wait()
 	wal.locker.Lock()
+	defer wal.locker.Unlock()
 	if wal.closed {
 		err = ErrClosed
-		wal.locker.Unlock()
 		return
 	}
-	if wal.uncommitted.Len() == 0 {
+	if wal.uncommittedIndexes.Len() == 0 {
 		err = errors.Join(errors.New("wal discard log failed"), errors.New("there is no uncommitted"))
-		wal.locker.Unlock()
 		return
 	}
 	if len(indexes) == 1 {
@@ -572,27 +692,30 @@ func (wal *WAL[K]) Discard(indexes ...uint64) (err error) {
 			err = errors.Join(errors.New("wal discard log failed"), err)
 		}
 	}
-	wal.locker.Unlock()
 	return
 }
 
 func (wal *WAL[K]) commitOrDiscard(index uint64, discard bool) (err error) {
-	_, uncommitted := wal.uncommitted.Get(index)
+	pos, uncommitted := wal.uncommittedIndexes.Get(index)
 	if !uncommitted {
-		err = ErrNotFound
+		err = ErrCommittedOrDiscarded
 		return
 	}
-	entry, pos, has, readErr := wal.read(index)
+	entry, readErr := wal.read(index)
 	if readErr != nil {
 		err = readErr
 		return
 	}
-	if !has {
-		err = ErrNotFound
+	key, decodeKeyErr := wal.keyEncoder.Decode(entry.Key())
+	if decodeKeyErr != nil {
+		err = decodeKeyErr
 		return
 	}
 	if entry.Finished() {
-		wal.uncommitted.Remove(index)
+		wal.uncommittedIndexes.Remove(index)
+		wal.uncommittedKeys.Remove(key)
+		wal.indexes.Set(index, pos)
+		wal.keys.Set(key, index)
 		return
 	}
 	if discard {
@@ -605,28 +728,34 @@ func (wal *WAL[K]) commitOrDiscard(index uint64, discard bool) (err error) {
 		err = writeErr
 		return
 	}
-	wal.uncommitted.Remove(index)
+	wal.cache.Add(index, entry)
+	wal.uncommittedIndexes.Remove(index)
+	wal.uncommittedKeys.Remove(key)
+	wal.indexes.Set(index, pos)
+	wal.keys.Set(key, index)
 	return
 }
 
 func (wal *WAL[K]) commitOrDiscardBatch(indexes []uint64, discard bool) (err error) {
-	items := posEntries(make([]*posEntry, 0, len(indexes)))
+	items := posEntries[K](make([]*posEntry[K], 0, len(indexes)))
 	for _, index := range indexes {
-		_, uncommitted := wal.uncommitted.Get(index)
+		pos, uncommitted := wal.uncommittedIndexes.Get(index)
 		if !uncommitted {
 			continue
 		}
-		entry, pos, has, readErr := wal.read(index)
+		entry, readErr := wal.read(index)
 		if readErr != nil {
 			err = readErr
 			return
 		}
-		if !has {
-			err = ErrNotFound
+		key, decodeErr := wal.keyEncoder.Decode(entry.Key())
+		if decodeErr != nil {
+			err = decodeErr
 			return
 		}
-		items = append(items, &posEntry{
+		items = append(items, &posEntry[K]{
 			entry: entry,
+			key:   key,
 			pos:   pos,
 		})
 	}
@@ -667,8 +796,13 @@ func (wal *WAL[K]) commitOrDiscardBatch(indexes []uint64, discard bool) (err err
 		return
 	}
 	for _, item := range items {
-		item.entry.Commit()
-		wal.uncommitted.Remove(item.entry.Index())
+		index := item.entry.Index()
+		key := item.key
+		wal.cache.Add(index, item.entry)
+		wal.uncommittedIndexes.Remove(index)
+		wal.uncommittedKeys.Remove(key)
+		wal.indexes.Set(index, pos)
+		wal.keys.Set(key, index)
 	}
 	return
 }
@@ -700,7 +834,7 @@ func (wal *WAL[K]) Batch() (batch *Batch[K]) {
 func (wal *WAL[K]) UncommittedSize() (n uint64) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
-	n = uint64(wal.uncommitted.Len())
+	n = uint64(wal.uncommittedIndexes.Len())
 	wal.locker.RUnlock()
 	return
 }
@@ -708,39 +842,31 @@ func (wal *WAL[K]) UncommittedSize() (n uint64) {
 func (wal *WAL[K]) Uncommitted(index uint64) (ok bool) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
-	ok = wal.getUncommitted(index)
+	_, ok = wal.uncommittedIndexes.Get(index)
 	wal.locker.RUnlock()
-	return
-}
-
-func (wal *WAL[K]) getUncommitted(index uint64) (ok bool) {
-	_, got := wal.uncommitted.Get(index)
-	ok = got
 	return
 }
 
 func (wal *WAL[K]) UncommittedKey(key K) (ok bool) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
-	ok = wal.getUncommittedKey(key)
+	_, ok = wal.uncommittedKeys.Get(key)
 	wal.locker.RUnlock()
-	return
-}
-
-func (wal *WAL[K]) getUncommittedKey(key K) (ok bool) {
-	index, has := wal.keys.Get(key)
-	if !has {
-		return
-	}
-	_, got := wal.uncommitted.Get(index)
-	ok = got
 	return
 }
 
 func (wal *WAL[K]) OldestUncommitted() (index uint64, has bool) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
-	index, _, has = wal.uncommitted.Min()
+	index, _, has = wal.uncommittedIndexes.Min()
+	wal.locker.RUnlock()
+	return
+}
+
+func (wal *WAL[K]) OldestUncommittedKey() (key K, has bool) {
+	wal.truncating.Wait()
+	wal.locker.RLock()
+	key, _, has = wal.uncommittedKeys.Min()
 	wal.locker.RUnlock()
 	return
 }
@@ -753,9 +879,10 @@ func (wal *WAL[K]) load() (err error) {
 	}
 	wal.nextBlockPos = wal.file.Size() / blockSize
 	readBlockIndex := uint64(0)
+	maxIndex := uint64(0)
 	for readBlockIndex < wal.nextBlockPos {
 		pos := readBlockIndex * blockSize
-		entry, readErr := wal.readFromFile(pos)
+		entry, readErr := wal.readFromDisk(pos)
 		if readErr != nil {
 			switch readErr {
 			case ErrNotFound, ErrInvalidEntry:
@@ -774,19 +901,39 @@ func (wal *WAL[K]) load() (err error) {
 			err = errors.Join(errors.New("wal load failed"), decodeErr)
 			return
 		}
+
 		index := entry.Index()
-		wal.indexes.Set(index, pos)
-		if !entry.Finished() {
-			wal.uncommitted.Set(index, pos)
+		if entry.Finished() {
+			wal.indexes.Set(index, pos)
+			wal.keys.Set(key, index)
+		} else {
+			wal.uncommittedIndexes.Set(index, pos)
+			wal.uncommittedKeys.Set(key, index)
 		}
-		wal.keys.Set(key, index)
 		wal.cache.Add(index, entry)
 		readBlockIndex += uint64(entry.Blocks())
+		if index > maxIndex {
+			maxIndex = index
+		}
 	}
-	maxIndex, _, hasMaxIndex := wal.indexes.Max()
-	if hasMaxIndex {
-		wal.nextIndex = maxIndex + 1
+	wal.nextIndex = maxIndex + 1
+	return
+}
+
+func (wal *WAL[K]) reload() (err error) {
+	wal.indexes = btree.New[uint64, uint64]()
+	wal.uncommittedIndexes = btree.New[uint64, uint64]()
+	wal.keys = btree.New[K, uint64]()
+	wal.uncommittedKeys = btree.New[K, uint64]()
+	wal.cache.Purge()
+	wal.nextIndex = 0
+	wal.nextBlockPos = 0
+	_, seekErr := wal.file.file.Seek(0, 0)
+	if seekErr != nil {
+		err = errors.Join(errors.New("wal reload failed"), seekErr)
+		return
 	}
+	err = wal.load()
 	return
 }
 
@@ -810,7 +957,7 @@ func (wal *WAL[K]) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 	// get oldest uncommitted entry
 	wal.locker.RLock()
 	firstIndex, _, hasFirst := wal.indexes.Min()
-	minUncommittedIndex, _, hasUncommittedMin := wal.uncommitted.Min()
+	minUncommittedIndex, _, hasUncommittedMin := wal.uncommittedIndexes.Min()
 	wal.locker.RUnlock()
 	if !hasFirst {
 		return
@@ -829,13 +976,13 @@ func (wal *WAL[K]) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 	buf := bytebufferpool.Get()
 	defer bytebufferpool.Put(buf)
 	for i := firstIndex; i <= endIndex; i++ {
-		entry, _, has, readErr := wal.read(i)
+		entry, readErr := wal.read(i)
 		if readErr != nil {
-			err = errors.Join(errors.New("wal read failed"), readErr)
+			if errors.Is(readErr, ErrNotFound) || errors.Is(readErr, ErrInvalidEntry) {
+				continue
+			}
+			err = errors.Join(errors.New("wal create snapshot failed"), readErr)
 			return
-		}
-		if !has {
-			continue
 		}
 		reads++
 		_, _ = buf.Write(entry)
@@ -894,12 +1041,12 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 		err = errors.Join(errors.New("wal truncate failed"), errors.New("can not truncate when making a snapshot"))
 		return
 	}
-	_, hasPos := wal.indexes.Get(endIndex)
-	if !hasPos {
+	_, has := wal.indexes.Get(endIndex)
+	if !has {
 		err = ErrNotFound
 		return
 	}
-	minUnCommittedIndex, _, hasMinUnCommitted := wal.uncommitted.Min()
+	minUnCommittedIndex, _, hasMinUnCommitted := wal.uncommittedIndexes.Min()
 	if hasMinUnCommitted && minUnCommittedIndex <= endIndex {
 		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d is greater and equals than min uncommitted index", endIndex)))
 		return
@@ -938,14 +1085,14 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 	writes := uint64(0)
 	startIndex := endIndex + 1
 	for i := startIndex; i <= maxIndex; i++ {
-		entry, _, has, readErr := wal.read(i)
-		if readErr != nil && readErr != ErrInvalidEntry {
+		entry, readErr := wal.read(i)
+		if readErr != nil {
+			if errors.Is(readErr, ErrNotFound) || errors.Is(readErr, ErrInvalidEntry) {
+				continue
+			}
 			cleanTmpFn(tmpFile, tmpFullFile)
 			err = errors.Join(errors.New("wal truncate failed"), readErr)
 			return
-		}
-		if !has || readErr == ErrInvalidEntry {
-			continue
 		}
 		max := len(entry)
 		n := 0
@@ -1008,23 +1155,14 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 
 	wal.file, err = OpenFile(originFilepath)
 	if err != nil {
-		err = errors.Join(errors.New("wal truncate failed"), renameErr)
+		err = errors.Join(errors.New("wal truncate failed"), err)
 		return
 	}
 
-	for i := minIndex; i <= endIndex; i++ {
-		entry, _, has, _ := wal.read(i)
-		if has {
-			kp := entry.Key()
-			key, decodeErr := wal.keyEncoder.Decode(kp)
-			if decodeErr != nil {
-				err = errors.Join(errors.New("wal truncate failed"), decodeErr)
-				return
-			}
-			wal.keys.Remove(key)
-		}
-		wal.indexes.Remove(i)
-		wal.cache.Remove(i)
+	err = wal.reload()
+	if err != nil {
+		err = errors.Join(errors.New("wal truncate failed"), err)
+		return
 	}
 	return
 }
@@ -1054,24 +1192,11 @@ func (wal *WAL[K]) TruncateBack(startIndex uint64) (err error) {
 		err = errors.Join(errors.New("wal truncate failed"), err)
 		return
 	}
-	endIndex, _, hasEnd := wal.indexes.Max()
-	if !hasEnd {
+
+	err = wal.reload()
+	if err != nil {
+		err = errors.Join(errors.New("wal truncate failed"), err)
 		return
-	}
-	for i := startIndex; i <= endIndex; i++ {
-		entry, _, has, _ := wal.read(i)
-		if has {
-			kp := entry.Key()
-			key, decodeErr := wal.keyEncoder.Decode(kp)
-			if decodeErr != nil {
-				err = errors.Join(errors.New("wal truncate failed"), decodeErr)
-				return
-			}
-			wal.keys.Remove(key)
-		}
-		wal.indexes.Remove(i)
-		wal.uncommitted.Remove(i)
-		wal.cache.Remove(i)
 	}
 	return
 }

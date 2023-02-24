@@ -149,22 +149,23 @@ func (entry Entry) Validate() (ok bool) {
 	return
 }
 
-type posEntry struct {
+type posEntry[K ordered] struct {
 	entry Entry
+	key   K
 	pos   uint64
 }
 
-type posEntries []*posEntry
+type posEntries[K ordered] []*posEntry[K]
 
-func (items posEntries) Len() int {
+func (items posEntries[K]) Len() int {
 	return len(items)
 }
 
-func (items posEntries) Less(i, j int) bool {
+func (items posEntries[K]) Less(i, j int) bool {
 	return items[i].pos < items[j].pos
 }
 
-func (items posEntries) Swap(i, j int) {
+func (items posEntries[K]) Swap(i, j int) {
 	items[i], items[j] = items[j], items[i]
 	return
 }
