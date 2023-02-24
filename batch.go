@@ -1,7 +1,7 @@
 package wal
 
 import (
-	"errors"
+	"github.com/aacfactory/errors"
 )
 
 type Batch[K ordered] struct {
@@ -14,14 +14,14 @@ type Batch[K ordered] struct {
 
 func (batch *Batch[K]) Write(key K, p []byte) (index uint64, err error) {
 	if batch.released {
-		err = errors.Join(errors.New("batch write failed"), errors.New("batch was released"))
+		err = errors.ServiceError("batch write failed").WithCause(errors.ServiceError("batch was released"))
 		return
 	}
 
 	if batch.wal.transactionEnabled {
 		_, has := batch.wal.uncommittedKeys.Get(key)
 		if has {
-			err = errors.Join(errors.New("batch write failed"), errors.New("prev key was not committed or discarded"))
+			err = errors.ServiceError("batch write failed").WithCause(errors.ServiceError("prev key was not committed or discarded"))
 			batch.release()
 			return
 		}
@@ -50,13 +50,13 @@ func (batch *Batch[K]) Flush() (err error) {
 		return
 	}
 	if batch.wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal batch flush failed").WithCause(ErrClosed)
 		return
 	}
 	pos := batch.wal.acquireNextBlockPos()
 	writeErr := batch.wal.file.WriteAt(batch.data, pos)
 	if writeErr != nil {
-		err = errors.Join(errors.New("flush batch wrote failed"), writeErr)
+		err = errors.ServiceError("flush batch wrote failed").WithCause(writeErr)
 		return
 	}
 	entries := DecodeEntries(batch.data)

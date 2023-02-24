@@ -1,8 +1,8 @@
 package wal
 
 import (
-	"errors"
 	"fmt"
+	"github.com/aacfactory/errors"
 	"github.com/aacfactory/wal/btree"
 	"github.com/aacfactory/wal/lru"
 	"github.com/valyala/bytebufferpool"
@@ -13,12 +13,12 @@ import (
 )
 
 var (
-	ErrInvalidEntry         = errors.New("invalid entry")
-	ErrClosed               = errors.New("wal was closed")
-	ErrNoFirstIndex         = errors.New("wal has no first index")
-	ErrNoLastIndex          = errors.New("wal has no last index")
-	ErrNotFound             = errors.New("not found")
-	ErrCommittedOrDiscarded = errors.New("entry was committed or discarded")
+	ErrInvalidEntry         = fmt.Errorf("invalid entry")
+	ErrClosed               = fmt.Errorf("wal was closed")
+	ErrNoFirstIndex         = fmt.Errorf("wal has no first index")
+	ErrNoLastIndex          = fmt.Errorf("wal has no last index")
+	ErrNotFound             = fmt.Errorf("not found")
+	ErrCommittedOrDiscarded = fmt.Errorf("entry was committed or discarded")
 )
 
 const (
@@ -83,7 +83,7 @@ type Options struct {
 
 func New[K ordered](path string, keyEncoder KeyEncoder[K], options ...Option) (wal *WAL[K], err error) {
 	if keyEncoder == nil {
-		err = errors.Join(errors.New("create wal failed"), errors.New("key encoder is required"))
+		err = errors.ServiceError("create wal failed").WithCause(errors.ServiceError("key encoder is required"))
 		return
 	}
 	opt := &Options{
@@ -101,7 +101,7 @@ func New[K ordered](path string, keyEncoder KeyEncoder[K], options ...Option) (w
 	}
 	if opt.TransactionEnabled {
 		if opt.TransactionLevel != ReadUncommitted && opt.TransactionLevel != ReadCommitted {
-			err = errors.Join(errors.New("create wal failed"), errors.New("invalid transaction level"))
+			err = errors.ServiceError("create wal failed").WithCause(errors.ServiceError("invalid transaction level"))
 			return
 		}
 	}
@@ -109,26 +109,26 @@ func New[K ordered](path string, keyEncoder KeyEncoder[K], options ...Option) (w
 	if openErr != nil {
 		// exist .truncated
 		if !ExistFile(path + ".truncated") {
-			err = errors.Join(errors.New("create wal failed"), openErr)
+			err = errors.ServiceError("create wal failed").WithCause(openErr)
 			return
 		}
 		// open .truncated
 		file, openErr = OpenFile(path + ".truncated")
 		if openErr != nil {
-			err = errors.Join(errors.New("create wal failed"), openErr)
+			err = errors.ServiceError("create wal failed").WithCause(openErr)
 			return
 		}
 		file.Close()
 		// rename
 		renameErr := os.Rename(path+".truncated", path)
 		if renameErr != nil {
-			err = errors.Join(errors.New("create wal failed"), renameErr)
+			err = errors.ServiceError("create wal failed").WithCause(renameErr)
 			return
 		}
 		// reopen
 		file, openErr = OpenFile(path)
 		if openErr != nil {
-			err = errors.Join(errors.New("create wal failed"), openErr)
+			err = errors.ServiceError("create wal failed").WithCause(openErr)
 			return
 		}
 	}
@@ -177,7 +177,7 @@ func (wal *WAL[K]) FirstIndex() (idx uint64, err error) {
 	wal.locker.RLock()
 	defer wal.locker.RUnlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal get first index failed").WithCause(ErrClosed)
 		return
 	}
 	min, _, has := wal.indexes.Min()
@@ -194,7 +194,7 @@ func (wal *WAL[K]) LastIndex() (idx uint64, err error) {
 	wal.locker.RLock()
 	defer wal.locker.RUnlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal get last index failed").WithCause(ErrClosed)
 		return
 	}
 	max, _, has := wal.indexes.Max()
@@ -211,7 +211,7 @@ func (wal *WAL[K]) FirstKey() (k K, err error) {
 	wal.locker.RLock()
 	defer wal.locker.RUnlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal get first key failed").WithCause(ErrClosed)
 		return
 	}
 	min, _, has := wal.keys.Min()
@@ -228,7 +228,7 @@ func (wal *WAL[K]) LastKey() (k K, err error) {
 	wal.locker.RLock()
 	defer wal.locker.RUnlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal get last key failed").WithCause(ErrClosed)
 		return
 	}
 	max, _, has := wal.keys.Max()
@@ -255,25 +255,25 @@ func (wal *WAL[K]) Read(index uint64) (key K, p []byte, state State, err error) 
 	wal.truncating.Wait()
 	wal.locker.RLock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal read failed").WithCause(ErrClosed)
 		wal.locker.RUnlock()
 		return
 	}
 	entry, _, got, readErr := wal.readWithTransaction(index)
 	wal.locker.RUnlock()
 	if readErr != nil {
-		err = readErr
+		err = errors.ServiceError("wal read failed").WithCause(readErr)
 		return
 	}
 	if !got {
-		err = ErrNotFound
+		err = errors.ServiceError("wal read failed").WithCause(ErrNotFound)
 		return
 	}
 
 	k, data := entry.Data()
 	key, err = wal.keyEncoder.Decode(k)
 	if err != nil {
-		err = errors.Join(errors.New("wal read failed"), err)
+		err = errors.ServiceError("wal read failed").WithCause(err)
 		return
 	}
 	p = data
@@ -285,18 +285,18 @@ func (wal *WAL[K]) Key(key K) (index uint64, p []byte, state State, err error) {
 	wal.truncating.Wait()
 	wal.locker.RLock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal read failed").WithCause(ErrClosed)
 		wal.locker.RUnlock()
 		return
 	}
 	entry, _, got, readErr := wal.readByKey(key)
 	wal.locker.RUnlock()
 	if readErr != nil {
-		err = readErr
+		err = errors.ServiceError("wal read failed").WithCause(readErr)
 		return
 	}
 	if !got {
-		err = ErrNotFound
+		err = errors.ServiceError("wal read failed").WithCause(ErrNotFound)
 		return
 	}
 	index = entry.Index()
@@ -308,20 +308,20 @@ func (wal *WAL[K]) Key(key K) (index uint64, p []byte, state State, err error) {
 func (wal *WAL[K]) Write(key K, p []byte) (index uint64, err error) {
 	k, encodeErr := wal.keyEncoder.Encode(key)
 	if encodeErr != nil {
-		err = encodeErr
+		err = errors.ServiceError("wal write failed").WithCause(encodeErr)
 		return
 	}
 	wal.truncating.Wait()
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal write failed").WithCause(ErrClosed)
 		return
 	}
 	if wal.transactionEnabled {
 		_, hasUncommitted := wal.uncommittedKeys.Get(key)
 		if hasUncommitted {
-			err = errors.Join(errors.New("wal write failed"), errors.New("prev key was not committed or discarded"))
+			err = errors.ServiceError("wal write failed").WithCause(errors.ServiceError("prev key was not committed or discarded"))
 			return
 		}
 	}
@@ -334,7 +334,7 @@ func (wal *WAL[K]) Write(key K, p []byte) (index uint64, err error) {
 	pos := wal.acquireNextBlockPos()
 	writeErr := wal.file.WriteAt(entry, pos)
 	if writeErr != nil {
-		err = errors.Join(errors.New("wal write failed"), writeErr)
+		err = errors.ServiceError("wal write failed").WithCause(writeErr)
 		return
 	}
 	if !wal.transactionEnabled {
@@ -352,7 +352,7 @@ func (wal *WAL[K]) RemoveKey(key K) (err error) {
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal remove failed").WithCause(ErrClosed)
 		return
 	}
 	index, has := wal.keys.Get(key)
@@ -371,7 +371,7 @@ func (wal *WAL[K]) Remove(index uint64) (err error) {
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal remove failed").WithCause(ErrClosed)
 		return
 	}
 	err = wal.remove(index)
@@ -383,19 +383,19 @@ func (wal *WAL[K]) remove(index uint64) (err error) {
 	if !has {
 		pos, has = wal.uncommittedIndexes.Get(index)
 		if !has {
-			err = errors.Join(errors.New("wal remove failed"), ErrNotFound)
+			err = errors.ServiceError("wal remove failed").WithCause(ErrNotFound)
 			return
 		}
 	}
 	entry, readErr := wal.read(index)
 	if readErr != nil {
-		err = errors.Join(errors.New("wal remove failed"), readErr)
+		err = errors.ServiceError("wal remove failed").WithCause(readErr)
 		return
 	}
 
 	key, decodeErr := wal.keyEncoder.Decode(entry.Key())
 	if decodeErr != nil {
-		err = errors.Join(errors.New("wal remove failed"), decodeErr)
+		err = errors.ServiceError("wal remove failed").WithCause(decodeErr)
 		return
 	}
 
@@ -403,7 +403,7 @@ func (wal *WAL[K]) remove(index uint64) (err error) {
 		entry.Remove()
 		err = wal.file.WriteAt(entry, pos)
 		if err != nil {
-			err = errors.Join(errors.New("wal remove failed"), err)
+			err = errors.ServiceError("wal remove failed").WithCause(err)
 			return
 		}
 	}
@@ -472,13 +472,8 @@ func (wal *WAL[K]) readWithTransaction(index uint64) (entry Entry, pos uint64, h
 	}
 	entry, err = wal.readFromDisk(pos)
 	if err != nil {
-		switch err {
-		case ErrNotFound, ErrInvalidEntry:
-			return
-		default:
-			err = errors.Join(errors.New("wal read failed"), err)
-			return
-		}
+		err = errors.ServiceError("wal read with transaction failed").WithCause(err)
+		return
 	}
 	has = true
 	return
@@ -494,12 +489,13 @@ func (wal *WAL[K]) read(index uint64) (entry Entry, err error) {
 	if !hasPos {
 		pos, hasPos = wal.uncommittedIndexes.Get(index)
 		if !hasPos {
-			err = ErrNotFound
+			err = errors.ServiceError("wal read failed").WithCause(ErrNotFound)
 			return
 		}
 	}
 	entry, err = wal.readFromDisk(pos)
 	if err != nil {
+		err = errors.ServiceError("wal read failed").WithCause(err)
 		return
 	}
 	wal.cache.Add(index, entry)
@@ -510,22 +506,22 @@ func (wal *WAL[K]) readFromDisk(pos uint64) (entry Entry, err error) {
 	block := NewBlock()
 	readErr := wal.file.ReadAt(block, pos)
 	if readErr != nil {
-		err = errors.Join(errors.New("wal read failed"), readErr)
+		err = errors.ServiceError("wal read disk failed").WithCause(readErr)
 		return
 	}
 	if !block.Validate() {
-		err = ErrInvalidEntry
+		err = errors.ServiceError("wal read disk failed").WithCause(ErrInvalidEntry)
 		return
 	}
 	_, span := block.Header()
 	if span == 1 {
 		entry = Entry(block)
 		if !entry.Validate() {
-			err = ErrInvalidEntry
+			err = errors.ServiceError("wal read disk failed").WithCause(ErrInvalidEntry)
 			return
 		}
 		if entry.Removed() {
-			err = ErrNotFound
+			err = errors.ServiceError("wal read disk failed").WithCause(ErrNotFound)
 			return
 		}
 		return
@@ -533,17 +529,17 @@ func (wal *WAL[K]) readFromDisk(pos uint64) (entry Entry, err error) {
 	entry = make([]byte, blockSize*span)
 	readErr = wal.file.ReadAt(entry, pos)
 	if readErr != nil {
-		err = errors.Join(errors.New("wal read failed"), readErr)
+		err = errors.ServiceError("wal read disk failed").WithCause(readErr)
 		return
 	}
 	if !entry.Validate() {
-		err = ErrInvalidEntry
 		wal.cache.Remove(entry.Index())
+		err = errors.ServiceError("wal read disk failed").WithCause(ErrInvalidEntry)
 		return
 	}
 	if entry.Removed() {
-		err = ErrNotFound
 		wal.cache.Remove(entry.Index())
+		err = errors.ServiceError("wal read disk failed").WithCause(ErrNotFound)
 		return
 	}
 	return
@@ -551,7 +547,7 @@ func (wal *WAL[K]) readFromDisk(pos uint64) (entry Entry, err error) {
 
 func (wal *WAL[K]) CommitKey(keys ...K) (err error) {
 	if !wal.transactionEnabled {
-		err = errors.Join(errors.New("wal commit log failed"), errors.New("transaction mode is disabled"))
+		err = errors.ServiceError("wal commit failed").WithCause(errors.ServiceError("transaction mode is disabled"))
 		return
 	}
 	if keys == nil || len(keys) == 0 {
@@ -561,11 +557,11 @@ func (wal *WAL[K]) CommitKey(keys ...K) (err error) {
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal commit failed").WithCause(ErrClosed)
 		return
 	}
 	if wal.uncommittedKeys.Len() == 0 {
-		err = errors.Join(errors.New("wal commit log failed"), errors.New("there is no uncommitted"))
+		err = errors.ServiceError("wal commit failed").WithCause(errors.ServiceError("there is no uncommitted"))
 		return
 	}
 	indexes := make([]uint64, 0, len(keys))
@@ -583,8 +579,8 @@ func (wal *WAL[K]) CommitKey(keys ...K) (err error) {
 		err = wal.commitOrDiscardBatch(indexes, false)
 	}
 	if err != nil {
-		if err != ErrNotFound {
-			err = errors.Join(errors.New("wal commit log failed"), err)
+		if !errors.Map(err).Contains(ErrNotFound) {
+			err = errors.ServiceError("wal commit failed").WithCause(err)
 		}
 	}
 	return
@@ -592,7 +588,7 @@ func (wal *WAL[K]) CommitKey(keys ...K) (err error) {
 
 func (wal *WAL[K]) Commit(indexes ...uint64) (err error) {
 	if !wal.transactionEnabled {
-		err = errors.Join(errors.New("wal commit log failed"), errors.New("transaction mode is disabled"))
+		err = errors.ServiceError("wal commit failed").WithCause(errors.ServiceError("transaction mode is disabled"))
 		return
 	}
 	if indexes == nil || len(indexes) == 0 {
@@ -602,11 +598,11 @@ func (wal *WAL[K]) Commit(indexes ...uint64) (err error) {
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal commit failed").WithCause(ErrClosed)
 		return
 	}
 	if wal.uncommittedIndexes.Len() == 0 {
-		err = errors.Join(errors.New("wal commit log failed"), errors.New("there is no uncommitted"))
+		err = errors.ServiceError("wal commit failed").WithCause(errors.ServiceError("there is no uncommitted"))
 		return
 	}
 	if len(indexes) == 1 {
@@ -615,8 +611,8 @@ func (wal *WAL[K]) Commit(indexes ...uint64) (err error) {
 		err = wal.commitOrDiscardBatch(indexes, false)
 	}
 	if err != nil {
-		if err != ErrNotFound {
-			err = errors.Join(errors.New("wal commit log failed"), err)
+		if !errors.Map(err).Contains(ErrNotFound) {
+			err = errors.ServiceError("wal commit failed").WithCause(err)
 		}
 	}
 	return
@@ -624,7 +620,7 @@ func (wal *WAL[K]) Commit(indexes ...uint64) (err error) {
 
 func (wal *WAL[K]) DiscardKey(keys ...K) (err error) {
 	if !wal.transactionEnabled {
-		err = errors.Join(errors.New("wal discard log failed"), errors.New("transaction mode is disabled"))
+		err = errors.ServiceError("wal discard failed").WithCause(errors.ServiceError("transaction mode is disabled"))
 		return
 	}
 	if keys == nil || len(keys) == 0 {
@@ -634,18 +630,18 @@ func (wal *WAL[K]) DiscardKey(keys ...K) (err error) {
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal discard failed").WithCause(ErrClosed)
 		return
 	}
 	if wal.uncommittedKeys.Len() == 0 {
-		err = errors.Join(errors.New("wal discard log failed"), errors.New("there is no uncommitted"))
+		err = errors.ServiceError("wal discard failed").WithCause(errors.ServiceError("there is no uncommitted"))
 		return
 	}
 	indexes := make([]uint64, 0, len(keys))
 	for _, key := range keys {
 		index, has := wal.uncommittedKeys.Get(key)
 		if !has {
-			err = ErrNotFound
+			err = errors.ServiceError("wal discard failed").WithCause(ErrNotFound)
 			return
 		}
 		indexes = append(indexes, index)
@@ -656,8 +652,8 @@ func (wal *WAL[K]) DiscardKey(keys ...K) (err error) {
 		err = wal.commitOrDiscardBatch(indexes, true)
 	}
 	if err != nil {
-		if err != ErrNotFound {
-			err = errors.Join(errors.New("wal discard log failed"), err)
+		if !errors.Map(err).Contains(ErrNotFound) {
+			err = errors.ServiceError("wal discard failed").WithCause(err)
 		}
 	}
 	return
@@ -665,7 +661,7 @@ func (wal *WAL[K]) DiscardKey(keys ...K) (err error) {
 
 func (wal *WAL[K]) Discard(indexes ...uint64) (err error) {
 	if !wal.transactionEnabled {
-		err = errors.Join(errors.New("wal discard log failed"), errors.New("transaction mode is disabled"))
+		err = errors.ServiceError("wal discard failed").WithCause(errors.ServiceError("transaction mode is disabled"))
 		return
 	}
 	if indexes == nil || len(indexes) == 0 {
@@ -675,11 +671,11 @@ func (wal *WAL[K]) Discard(indexes ...uint64) (err error) {
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal discard failed").WithCause(errors.ServiceError("there is no uncommitted"))
 		return
 	}
 	if wal.uncommittedIndexes.Len() == 0 {
-		err = errors.Join(errors.New("wal discard log failed"), errors.New("there is no uncommitted"))
+		err = errors.ServiceError("wal discard failed").WithCause(errors.ServiceError("there is no uncommitted"))
 		return
 	}
 	if len(indexes) == 1 {
@@ -688,8 +684,8 @@ func (wal *WAL[K]) Discard(indexes ...uint64) (err error) {
 		err = wal.commitOrDiscardBatch(indexes, true)
 	}
 	if err != nil {
-		if err != ErrNotFound {
-			err = errors.Join(errors.New("wal discard log failed"), err)
+		if !errors.Map(err).Contains(ErrNotFound) {
+			err = errors.ServiceError("wal discard failed").WithCause(err)
 		}
 	}
 	return
@@ -889,7 +885,7 @@ func (wal *WAL[K]) load() (err error) {
 				readBlockIndex += uint64(entry.Blocks())
 				break
 			default:
-				err = errors.Join(errors.New("wal load failed"), readErr)
+				err = errors.ServiceError("wal load failed").WithCause(readErr)
 				return
 			}
 			continue
@@ -898,7 +894,7 @@ func (wal *WAL[K]) load() (err error) {
 		kp := entry.Key()
 		key, decodeErr := wal.keyEncoder.Decode(kp)
 		if decodeErr != nil {
-			err = errors.Join(errors.New("wal load failed"), decodeErr)
+			err = errors.ServiceError("wal load failed").WithCause(decodeErr)
 			return
 		}
 
@@ -928,9 +924,9 @@ func (wal *WAL[K]) reload() (err error) {
 	wal.cache.Purge()
 	wal.nextIndex = 0
 	wal.nextBlockPos = 0
-	_, seekErr := wal.file.file.Seek(0, 0)
-	if seekErr != nil {
-		err = errors.Join(errors.New("wal reload failed"), seekErr)
+	reopenErr := wal.file.Reopen()
+	if reopenErr != nil {
+		err = errors.ServiceError("wal reload failed").WithCause(reopenErr)
 		return
 	}
 	err = wal.load()
@@ -942,12 +938,12 @@ func (wal *WAL[K]) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 	wal.truncating.Wait()
 	wal.locker.Lock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal create snapshot failed").WithCause(ErrClosed)
 		wal.locker.Unlock()
 		return
 	}
 	if wal.snapshotting {
-		err = errors.Join(errors.New("wal create snapshot failed"), errors.New("the last snapshot has not been completed"))
+		err = errors.ServiceError("wal create snapshot failed").WithCause(errors.ServiceError("the last snapshot has not been completed"))
 		wal.locker.Unlock()
 		return
 	}
@@ -963,11 +959,11 @@ func (wal *WAL[K]) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 		return
 	}
 	if hasUncommittedMin && minUncommittedIndex <= endIndex {
-		err = errors.Join(errors.New("wal create snapshot failed"), errors.New("min uncommitted index is less than end index"))
+		err = errors.ServiceError("wal create snapshot failed").WithCause(errors.ServiceError("min uncommitted index is less than end index"))
 		return
 	}
 	if endIndex < firstIndex {
-		err = errors.Join(errors.New("wal create snapshot failed"), errors.New("end index is less than first index"))
+		err = errors.ServiceError("wal create snapshot failed").WithCause(errors.ServiceError("end index is less than first index"))
 		return
 	}
 
@@ -978,10 +974,10 @@ func (wal *WAL[K]) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 	for i := firstIndex; i <= endIndex; i++ {
 		entry, readErr := wal.read(i)
 		if readErr != nil {
-			if errors.Is(readErr, ErrNotFound) || errors.Is(readErr, ErrInvalidEntry) {
+			if errors.Map(readErr).Contains(ErrNotFound) || errors.Map(readErr).Contains(ErrInvalidEntry) {
 				continue
 			}
-			err = errors.Join(errors.New("wal create snapshot failed"), readErr)
+			err = errors.ServiceError("wal create snapshot failed").WithCause(readErr)
 			return
 		}
 		reads++
@@ -995,7 +991,7 @@ func (wal *WAL[K]) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 		for n < pLen {
 			nn, writeErr := sink.Write(p[n:])
 			if writeErr != nil {
-				err = errors.Join(errors.New("wal create snapshot failed"), writeErr)
+				err = errors.ServiceError("wal create snapshot failed").WithCause(writeErr)
 				return
 			}
 			n += nn
@@ -1010,7 +1006,7 @@ func (wal *WAL[K]) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 		for n < pLen {
 			nn, writeErr := sink.Write(p[n:])
 			if writeErr != nil {
-				err = errors.Join(errors.New("wal create snapshot failed"), writeErr)
+				err = errors.ServiceError("wal create snapshot failed").WithCause(writeErr)
 				return
 			}
 			n += nn
@@ -1031,14 +1027,14 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal truncate failed").WithCause(ErrClosed)
 		wal.locker.Unlock()
 		return
 	}
 	wal.truncating.Add(1)
 	defer wal.truncating.Done()
 	if wal.snapshotting {
-		err = errors.Join(errors.New("wal truncate failed"), errors.New("can not truncate when making a snapshot"))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError("can not truncate when making a snapshot"))
 		return
 	}
 	_, has := wal.indexes.Get(endIndex)
@@ -1048,17 +1044,17 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 	}
 	minUnCommittedIndex, _, hasMinUnCommitted := wal.uncommittedIndexes.Min()
 	if hasMinUnCommitted && minUnCommittedIndex <= endIndex {
-		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d is greater and equals than min uncommitted index", endIndex)))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError(fmt.Sprintf("%d is greater and equals than min uncommitted index", endIndex)))
 		return
 	}
 	minIndex, _, hasMinIndex := wal.indexes.Min()
 	if hasMinIndex && minIndex > endIndex {
-		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d is less than min index", endIndex)))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError(fmt.Sprintf("%d is less than min index", endIndex)))
 		return
 	}
 	maxIndex, _, hasMaxIndex := wal.indexes.Max()
 	if !hasMaxIndex {
-		err = errors.Join(errors.New("wal truncate failed"), errors.New("there is no max index"))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError("there is no max index"))
 		return
 	}
 
@@ -1071,14 +1067,14 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 	tmpFilepath := wal.file.Path() + ".truncating"
 	tmpFile, openTmpErr := os.OpenFile(tmpFilepath, os.O_CREATE|os.O_TRUNC|os.O_SYNC|os.O_RDWR, 0640)
 	if openTmpErr != nil {
-		err = errors.Join(errors.New("wal truncate failed"), openTmpErr)
+		err = errors.ServiceError("wal truncate failed").WithCause(openTmpErr)
 		return
 	}
 	tmpFullFilepath := wal.file.Path() + ".truncated"
 	tmpFullFile, openFullErr := os.OpenFile(tmpFullFilepath, os.O_CREATE|os.O_TRUNC|os.O_SYNC|os.O_RDWR, 0640)
 	if openFullErr != nil {
 		cleanTmpFn(tmpFile)
-		err = errors.Join(errors.New("wal truncate failed"), openFullErr)
+		err = errors.ServiceError("wal truncate failed").WithCause(openFullErr)
 		return
 	}
 
@@ -1087,11 +1083,11 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 	for i := startIndex; i <= maxIndex; i++ {
 		entry, readErr := wal.read(i)
 		if readErr != nil {
-			if errors.Is(readErr, ErrNotFound) || errors.Is(readErr, ErrInvalidEntry) {
+			if errors.Map(readErr).Contains(ErrNotFound) || errors.Map(readErr).Contains(ErrInvalidEntry) {
 				continue
 			}
 			cleanTmpFn(tmpFile, tmpFullFile)
-			err = errors.Join(errors.New("wal truncate failed"), readErr)
+			err = errors.ServiceError("wal truncate failed").WithCause(readErr)
 			return
 		}
 		max := len(entry)
@@ -1100,7 +1096,7 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 			nn, writeErr := tmpFile.Write(entry[n:])
 			if writeErr != nil {
 				cleanTmpFn(tmpFile, tmpFullFile)
-				err = errors.Join(errors.New("wal truncate failed"), writeErr)
+				err = errors.ServiceError("wal truncate failed").WithCause(writeErr)
 				return
 			}
 			n += nn
@@ -1110,32 +1106,32 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 	syncErr := tmpFile.Sync()
 	if syncErr != nil {
 		cleanTmpFn(tmpFile, tmpFullFile)
-		err = errors.Join(errors.New("wal truncate failed"), syncErr)
+		err = errors.ServiceError("wal truncate failed").WithCause(syncErr)
 		return
 	}
 
 	_, seekErr := tmpFile.Seek(0, 0)
 	if seekErr != nil {
 		cleanTmpFn(tmpFile, tmpFullFile)
-		err = errors.Join(errors.New("wal truncate failed"), seekErr)
+		err = errors.ServiceError("wal truncate failed").WithCause(seekErr)
 		return
 	}
 	copied, cpErr := io.Copy(tmpFullFile, tmpFile)
 	if cpErr != nil {
 		cleanTmpFn(tmpFile, tmpFullFile)
-		err = errors.Join(errors.New("wal truncate failed"), cpErr)
+		err = errors.ServiceError("wal truncate failed").WithCause(cpErr)
 		return
 	}
 
 	if uint64(copied) != writes {
 		cleanTmpFn(tmpFile, tmpFullFile)
-		err = errors.Join(errors.New("wal truncate failed"), errors.New("not copy full"))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError("not copy full"))
 		return
 	}
 	syncFullErr := tmpFullFile.Sync()
 	if syncFullErr != nil {
 		cleanTmpFn(tmpFile, tmpFullFile)
-		err = errors.Join(errors.New("wal truncate failed"), syncFullErr)
+		err = errors.ServiceError("wal truncate failed").WithCause(syncFullErr)
 		return
 	}
 	_ = tmpFile.Close()
@@ -1149,19 +1145,19 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 	_ = os.Remove(originFilepath)
 	renameErr := os.Rename(tmpFullFilepath, originFilepath)
 	if renameErr != nil {
-		err = errors.Join(errors.New("wal truncate failed"), renameErr)
+		err = errors.ServiceError("wal truncate failed").WithCause(renameErr)
 		return
 	}
 
 	wal.file, err = OpenFile(originFilepath)
 	if err != nil {
-		err = errors.Join(errors.New("wal truncate failed"), err)
+		err = errors.ServiceError("wal truncate failed").WithCause(err)
 		return
 	}
 
 	err = wal.reload()
 	if err != nil {
-		err = errors.Join(errors.New("wal truncate failed"), err)
+		err = errors.ServiceError("wal truncate failed").WithCause(err)
 		return
 	}
 	return
@@ -1172,30 +1168,30 @@ func (wal *WAL[K]) TruncateBack(startIndex uint64) (err error) {
 	wal.locker.Lock()
 	defer wal.locker.Unlock()
 	if wal.closed {
-		err = ErrClosed
+		err = errors.ServiceError("wal truncate failed").WithCause(ErrClosed)
 		wal.locker.Unlock()
 		return
 	}
 	wal.truncating.Add(1)
 	defer wal.truncating.Done()
 	if wal.snapshotting {
-		err = errors.Join(errors.New("wal truncate failed"), errors.New("can not truncate when making a snapshot"))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError("can not truncate when making a snapshot"))
 		return
 	}
 	pos, hasPos := wal.indexes.Get(startIndex)
 	if !hasPos {
-		err = errors.Join(errors.New("wal truncate failed"), errors.New(fmt.Sprintf("%d was not found", startIndex)))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError(fmt.Sprintf("%d was not found", startIndex)))
 		return
 	}
 	err = wal.file.Truncate(pos)
 	if err != nil {
-		err = errors.Join(errors.New("wal truncate failed"), err)
+		err = errors.ServiceError("wal truncate failed").WithCause(err)
 		return
 	}
 
 	err = wal.reload()
 	if err != nil {
-		err = errors.Join(errors.New("wal truncate failed"), err)
+		err = errors.ServiceError("wal truncate failed").WithCause(err)
 		return
 	}
 	return

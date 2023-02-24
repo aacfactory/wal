@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"github.com/aacfactory/errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,16 +11,17 @@ import (
 func OpenFile(path string) (file *File, err error) {
 	path, err = filepath.Abs(path)
 	if err != nil {
+		err = errors.ServiceError("open file failed").WithCause(err).WithMeta("file", path)
 		return
 	}
 	f, openErr := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_SYNC, 0640)
 	if openErr != nil {
-		err = openErr
+		err = errors.ServiceError("open file failed").WithCause(openErr).WithMeta("file", path)
 		return
 	}
 	stat, statErr := f.Stat()
 	if statErr != nil {
-		err = statErr
+		err = errors.ServiceError("open file failed").WithCause(statErr).WithMeta("file", path)
 		return
 	}
 	file = &File{
@@ -34,6 +36,21 @@ type File struct {
 	locker sync.RWMutex
 	file   *os.File
 	size   uint64
+}
+
+func (f *File) Reopen() (err error) {
+	f.locker.Lock()
+	defer f.locker.Unlock()
+	path := f.Path()
+	_ = f.file.Sync()
+	_ = f.file.Close()
+	file, openErr := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_SYNC, 0640)
+	if openErr != nil {
+		err = errors.ServiceError("reopen file failed").WithCause(openErr).WithMeta("file", path)
+		return
+	}
+	f.file = file
+	return
 }
 
 func (f *File) Size() (n uint64) {
@@ -54,7 +71,7 @@ func (f *File) ReadAt(p []byte, start uint64) (err error) {
 			if readErr == io.EOF {
 				readErr = io.ErrUnexpectedEOF
 			}
-			err = readErr
+			err = errors.ServiceError("read file failed").WithCause(readErr).WithMeta("file", f.file.Name())
 			f.locker.RUnlock()
 			return
 		}
@@ -73,7 +90,7 @@ func (f *File) WriteAt(p []byte, start uint64) (err error) {
 	for n < max {
 		nn, writeErr := f.file.WriteAt(p[n:], off)
 		if writeErr != nil {
-			err = writeErr
+			err = errors.ServiceError("write file failed").WithCause(writeErr).WithMeta("file", f.file.Name())
 			f.locker.Unlock()
 			return
 		}
@@ -93,6 +110,9 @@ func (f *File) WriteAt(p []byte, start uint64) (err error) {
 func (f *File) Truncate(end uint64) (err error) {
 	f.locker.Lock()
 	err = f.file.Truncate(int64(end))
+	if err != nil {
+		err = errors.ServiceError("write file failed").WithCause(err).WithMeta("file", f.file.Name())
+	}
 	f.locker.Unlock()
 	return
 }
