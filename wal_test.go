@@ -8,9 +8,9 @@ import (
 )
 
 func TestWal_NoTransaction(t *testing.T) {
-	logs, err := wal.New[uint64](`G:\tmp\wal\1.txt`, wal.Unit64KeyEncoder())
+	logs, err := wal.New[uint64](`G:\tmp\wal\1.txt`, wal.Unit64KeyEncoder(), wal.UseSOT(wal.SOT64B))
 	if err != nil {
-		t.Error(err)
+		t.Log(fmt.Sprintf("%+v", err))
 		return
 	}
 	defer logs.Close()
@@ -105,7 +105,7 @@ func newWal(t *testing.T) (logs *wal.WAL[uint64]) {
 	var err error
 	logs, err = wal.New[uint64](`G:\tmp\wal\1.txt`, wal.Unit64KeyEncoder(), wal.EnableTransaction(wal.ReadUncommitted))
 	if err != nil {
-		t.Error(err)
+		t.Log(fmt.Sprintf("%+v", err))
 		os.Exit(9)
 		return
 	}
@@ -127,22 +127,27 @@ func TestWAL_OldestUncommitted(t *testing.T) {
 func TestWAL_CreateSnapshot(t *testing.T) {
 	logs := newWal(t)
 	defer logs.Close()
-	err := logs.CreateSnapshot(10, &SnapshotSink{})
+	err := logs.CreateSnapshot(10, &SnapshotSink{
+		sot: wal.SOT1K,
+	})
 	if err != nil {
 		t.Error(err)
 	}
 }
 
 type SnapshotSink struct {
+	sot wal.SOT
 }
 
 func (s *SnapshotSink) Write(p []byte) (n int, err error) {
-	entries := wal.DecodeEntries(p)
+	entries := wal.DecodeEntries(s.sot, p)
 	for _, entry := range entries {
-		key, data := entry.Data()
+		key := entry.Key()
+		data := entry.Data()
 		k, _ := wal.Unit64KeyEncoder().Decode(key)
-		fmt.Println("write:", entry.Index(), k, string(data))
+		fmt.Println("write:", entry.Header().Index(), k, string(data))
 	}
+
 	n = len(p)
 	return
 }

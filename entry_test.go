@@ -14,8 +14,14 @@ func TestEntry_Data(t *testing.T) {
 		p = append(p, '|')
 	}
 	fmt.Println(string(p))
-	entry := wal.NewEntry(1, []byte("0"), p)
-	key, b := entry.Data()
-	fmt.Println(entry.Index(), entry.Blocks(), string(key), bytes.Equal(p, b), string(b))
+	entry := wal.NewEntry(wal.SOT64B, 1, []byte("abc"), p)
+	entry.Commit()
+	entry.Remove()
+	key := entry.Key()
+	data := entry.Data()
+	fmt.Println("header:", entry.Header())
+	fmt.Println("teus:", entry.TEUsLen())
+	fmt.Println("key:", string(key))
+	fmt.Println("data:", bytes.Equal(p, data), string(data))
 
 }

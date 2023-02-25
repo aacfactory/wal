@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"encoding/binary"
 	"fmt"
 	"github.com/aacfactory/errors"
 	"github.com/aacfactory/wal/btree"
@@ -15,10 +16,10 @@ import (
 var (
 	ErrInvalidEntry         = fmt.Errorf("invalid entry")
 	ErrClosed               = fmt.Errorf("wal was closed")
-	ErrNoFirstIndex         = fmt.Errorf("wal has no first index")
-	ErrNoLastIndex          = fmt.Errorf("wal has no last index")
+	ErrNoFirstIndex         = fmt.Errorf("wal has no first Index")
+	ErrNoLastIndex          = fmt.Errorf("wal has no last Index")
 	ErrNotFound             = fmt.Errorf("not found")
-	ErrCommittedOrDiscarded = fmt.Errorf("entry was committed or discarded")
+	ErrCommittedOrDiscarded = fmt.Errorf("entry was Committed or Discarded")
 )
 
 const (
@@ -27,19 +28,23 @@ const (
 	DiscardedState
 )
 
-type State int
+type State uint16
 
 func (state State) String() string {
 	switch state {
 	case UncommittedState:
 		return "uncommitted"
 	case DiscardedState:
-		return "discarded"
+		return "Discarded"
 	case CommittedState:
-		return "committed"
+		return "Committed"
 	default:
 		return fmt.Sprintf("Unknown(%d)", state)
 	}
+}
+
+func (state State) value() uint16 {
+	return uint16(state)
 }
 
 const (
@@ -62,6 +67,12 @@ func (level TransactionLevel) String() string {
 
 type Option func(options *Options)
 
+func UseSOT(sot SOT) Option {
+	return func(options *Options) {
+		options.SOT = sot
+	}
+}
+
 func WithCacheSize(size int) Option {
 	return func(options *Options) {
 		options.CacheSize = size
@@ -76,6 +87,7 @@ func EnableTransaction(level TransactionLevel) Option {
 }
 
 type Options struct {
+	SOT                SOT
 	CacheSize          int
 	TransactionEnabled bool
 	TransactionLevel   TransactionLevel
@@ -87,6 +99,7 @@ func New[K ordered](path string, keyEncoder KeyEncoder[K], options ...Option) (w
 		return
 	}
 	opt := &Options{
+		SOT:                SOT1K,
 		CacheSize:          8196,
 		TransactionEnabled: false,
 		TransactionLevel:   TransactionLevel(0),
@@ -144,8 +157,9 @@ func New[K ordered](path string, keyEncoder KeyEncoder[K], options ...Option) (w
 		keyEncoder:         keyEncoder,
 		cache:              lru.New[uint64, Entry](uint32(opt.CacheSize)),
 		file:               file,
+		sot:                opt.SOT,
 		nextIndex:          0,
-		nextBlockPos:       0,
+		nextTEUPos:         0,
 		closed:             false,
 		snapshotting:       false,
 		truncating:         sync.WaitGroup{},
@@ -165,8 +179,9 @@ type WAL[K ordered] struct {
 	keyEncoder         KeyEncoder[K]
 	cache              *lru.LRU[uint64, Entry]
 	file               *File
+	sot                SOT
 	nextIndex          uint64
-	nextBlockPos       uint64
+	nextTEUPos         uint64
 	snapshotting       bool
 	truncating         sync.WaitGroup
 	closed             bool
@@ -177,7 +192,7 @@ func (wal *WAL[K]) FirstIndex() (idx uint64, err error) {
 	wal.locker.RLock()
 	defer wal.locker.RUnlock()
 	if wal.closed {
-		err = errors.ServiceError("wal get first index failed").WithCause(ErrClosed)
+		err = errors.ServiceError("wal get first Index failed").WithCause(ErrClosed)
 		return
 	}
 	min, _, has := wal.indexes.Min()
@@ -194,7 +209,7 @@ func (wal *WAL[K]) LastIndex() (idx uint64, err error) {
 	wal.locker.RLock()
 	defer wal.locker.RUnlock()
 	if wal.closed {
-		err = errors.ServiceError("wal get last index failed").WithCause(ErrClosed)
+		err = errors.ServiceError("wal get last Index failed").WithCause(ErrClosed)
 		return
 	}
 	max, _, has := wal.indexes.Max()
@@ -270,14 +285,13 @@ func (wal *WAL[K]) Read(index uint64) (key K, p []byte, state State, err error) 
 		return
 	}
 
-	k, data := entry.Data()
-	key, err = wal.keyEncoder.Decode(k)
+	key, err = wal.keyEncoder.Decode(entry.Key())
 	if err != nil {
 		err = errors.ServiceError("wal read failed").WithCause(err)
 		return
 	}
-	p = data
-	state = State(entry.State())
+	p = entry.Data()
+	state = entry.Header().State()
 	return
 }
 
@@ -299,9 +313,9 @@ func (wal *WAL[K]) Key(key K) (index uint64, p []byte, state State, err error) {
 		err = errors.ServiceError("wal read failed").WithCause(ErrNotFound)
 		return
 	}
-	index = entry.Index()
-	_, p = entry.Data()
-	state = State(entry.State())
+	index = entry.Header().Index()
+	p = entry.Data()
+	state = entry.Header().State()
 	return
 }
 
@@ -321,17 +335,17 @@ func (wal *WAL[K]) Write(key K, p []byte) (index uint64, err error) {
 	if wal.transactionEnabled {
 		_, hasUncommitted := wal.uncommittedKeys.Get(key)
 		if hasUncommitted {
-			err = errors.ServiceError("wal write failed").WithCause(errors.ServiceError("prev key was not committed or discarded"))
+			err = errors.ServiceError("wal write failed").WithCause(errors.ServiceError("prev key was not Committed or Discarded"))
 			return
 		}
 	}
 
 	index = wal.nextIndex
-	entry := NewEntry(index, k, p)
+	entry := NewEntry(wal.sot, index, k, p)
 	if !wal.transactionEnabled {
 		entry.Commit()
 	}
-	pos := wal.acquireNextBlockPos()
+	pos := wal.acquireNextTEUPos()
 	writeErr := wal.file.WriteAt(entry, pos)
 	if writeErr != nil {
 		err = errors.ServiceError("wal write failed").WithCause(writeErr)
@@ -342,8 +356,7 @@ func (wal *WAL[K]) Write(key K, p []byte) (index uint64, err error) {
 	} else {
 		wal.mountWriteUncommitted(key, entry, pos)
 	}
-	wal.incrNextIndexAndBlockPos(entry)
-	//wal.cache.Add(index, entry)
+	wal.incrNextIndexAndTEUPos(entry)
 	return
 }
 
@@ -399,7 +412,7 @@ func (wal *WAL[K]) remove(index uint64) (err error) {
 		return
 	}
 
-	if !entry.Removed() {
+	if !entry.Header().Removed() {
 		entry.Remove()
 		err = wal.file.WriteAt(entry, pos)
 		if err != nil {
@@ -416,26 +429,26 @@ func (wal *WAL[K]) remove(index uint64) (err error) {
 	return
 }
 
-func (wal *WAL[K]) acquireNextBlockPos() (pos uint64) {
-	pos = wal.nextBlockPos * blockSize
+func (wal *WAL[K]) acquireNextTEUPos() (pos uint64) {
+	pos = wal.nextTEUPos * uint64(wal.sot)
 	return
 }
 
-func (wal *WAL[K]) incrNextIndexAndBlockPos(entry Entry) {
+func (wal *WAL[K]) incrNextIndexAndTEUPos(entry Entry) {
 	wal.nextIndex++
-	wal.nextBlockPos += uint64(entry.Blocks())
+	wal.nextTEUPos += uint64(entry.TEUsLen())
 	return
 }
 
 func (wal *WAL[K]) mountWriteCommitted(key K, entry Entry, pos uint64) {
-	index := entry.Index()
+	index := entry.Header().Index()
 	wal.indexes.Set(index, pos)
 	wal.keys.Set(key, index)
 	wal.cache.Add(index, entry)
 }
 
 func (wal *WAL[K]) mountWriteUncommitted(key K, entry Entry, pos uint64) {
-	index := entry.Index()
+	index := entry.Header().Index()
 	wal.uncommittedIndexes.Set(index, pos)
 	wal.uncommittedKeys.Set(key, index)
 	wal.cache.Add(index, entry)
@@ -503,42 +516,42 @@ func (wal *WAL[K]) read(index uint64) (entry Entry, err error) {
 }
 
 func (wal *WAL[K]) readFromDisk(pos uint64) (entry Entry, err error) {
-	block := NewBlock()
-	readErr := wal.file.ReadAt(block, pos)
+	teu := NewTEU(wal.sot)
+	readErr := wal.file.ReadAt(teu, pos)
 	if readErr != nil {
 		err = errors.ServiceError("wal read disk failed").WithCause(readErr)
 		return
 	}
-	if !block.Validate() {
+	if !teu.validate() {
 		err = errors.ServiceError("wal read disk failed").WithCause(ErrInvalidEntry)
 		return
 	}
-	_, span := block.Header()
+	span := teu.span()
 	if span == 1 {
-		entry = Entry(block)
+		entry = Entry(teu)
 		if !entry.Validate() {
 			err = errors.ServiceError("wal read disk failed").WithCause(ErrInvalidEntry)
 			return
 		}
-		if entry.Removed() {
+		if entry.Header().Removed() {
 			err = errors.ServiceError("wal read disk failed").WithCause(ErrNotFound)
 			return
 		}
 		return
 	}
-	entry = make([]byte, blockSize*span)
+	entry = make([]byte, wal.sot.value()*span)
 	readErr = wal.file.ReadAt(entry, pos)
 	if readErr != nil {
 		err = errors.ServiceError("wal read disk failed").WithCause(readErr)
 		return
 	}
 	if !entry.Validate() {
-		wal.cache.Remove(entry.Index())
+		wal.cache.Remove(entry.Header().Index())
 		err = errors.ServiceError("wal read disk failed").WithCause(ErrInvalidEntry)
 		return
 	}
-	if entry.Removed() {
-		wal.cache.Remove(entry.Index())
+	if entry.Header().Removed() {
+		wal.cache.Remove(entry.Header().Index())
 		err = errors.ServiceError("wal read disk failed").WithCause(ErrNotFound)
 		return
 	}
@@ -707,7 +720,7 @@ func (wal *WAL[K]) commitOrDiscard(index uint64, discard bool) (err error) {
 		err = decodeKeyErr
 		return
 	}
-	if entry.Finished() {
+	if entry.Header().StateFinished() {
 		wal.uncommittedIndexes.Remove(index)
 		wal.uncommittedKeys.Remove(key)
 		wal.indexes.Set(index, pos)
@@ -757,7 +770,7 @@ func (wal *WAL[K]) commitOrDiscardBatch(indexes []uint64, discard bool) (err err
 	}
 	sort.Sort(items)
 	pos := items[0].pos
-	segment := make([]byte, 0, blockSize)
+	segment := make([]byte, 0, wal.sot.value())
 	segment = append(segment, items[0].entry...)
 	for i := 1; i < len(items); i++ {
 		low := items[i-1].pos
@@ -792,7 +805,7 @@ func (wal *WAL[K]) commitOrDiscardBatch(indexes []uint64, discard bool) (err err
 		return
 	}
 	for _, item := range items {
-		index := item.entry.Index()
+		index := item.entry.Header().Index()
 		key := item.key
 		wal.cache.Add(index, item.entry)
 		wal.uncommittedIndexes.Remove(index)
@@ -820,7 +833,7 @@ func (wal *WAL[K]) Batch() (batch *Batch[K]) {
 	batch = &Batch[K]{
 		wal:       wal,
 		keys:      make([]K, 0, 1),
-		data:      make([]byte, 0, blockSize),
+		data:      make([]byte, 0, wal.sot.value()),
 		nextIndex: wal.nextIndex,
 		released:  false,
 	}
@@ -869,26 +882,37 @@ func (wal *WAL[K]) OldestUncommittedKey() (key K, has bool) {
 
 func (wal *WAL[K]) load() (err error) {
 	if wal.file.Size() == 0 {
-		wal.nextBlockPos = 0
+		wal.nextTEUPos = 0
 		wal.nextIndex = 0
 		return
 	}
-	wal.nextBlockPos = wal.file.Size() / blockSize
-	readBlockIndex := uint64(0)
+	p := make([]byte, 2)
+	readSOTErr := wal.file.ReadAt(p, 0)
+	if readSOTErr != nil {
+		err = errors.ServiceError("wal load failed").WithCause(readSOTErr)
+		return
+	}
+	fileSOT := SOT(binary.BigEndian.Uint16(p))
+	if fileSOT.value() != wal.sot.value() {
+		err = errors.ServiceError("wal load failed").WithCause(errors.ServiceError("invalid sot")).
+			WithMeta("file_sot", fileSOT.String()).
+			WithMeta("wal_sot", wal.sot.String())
+		return
+	}
+
+	wal.nextTEUPos = wal.file.Size() / uint64(wal.sot)
+	readTEUIndex := uint64(0)
 	maxIndex := uint64(0)
-	for readBlockIndex < wal.nextBlockPos {
-		pos := readBlockIndex * blockSize
+	for readTEUIndex < wal.nextTEUPos {
+		pos := readTEUIndex * uint64(wal.sot)
 		entry, readErr := wal.readFromDisk(pos)
 		if readErr != nil {
-			switch readErr {
-			case ErrNotFound, ErrInvalidEntry:
-				readBlockIndex += uint64(entry.Blocks())
-				break
-			default:
-				err = errors.ServiceError("wal load failed").WithCause(readErr)
-				return
+			if errors.Map(readErr).Contains(ErrNotFound) || errors.Map(readErr).Contains(ErrInvalidEntry) {
+				readTEUIndex += uint64(entry.TEUsLen())
+				continue
 			}
-			continue
+			err = errors.ServiceError("wal load failed").WithCause(readErr)
+			return
 		}
 
 		kp := entry.Key()
@@ -898,8 +922,8 @@ func (wal *WAL[K]) load() (err error) {
 			return
 		}
 
-		index := entry.Index()
-		if entry.Finished() {
+		index := entry.Header().Index()
+		if entry.Header().StateFinished() {
 			wal.indexes.Set(index, pos)
 			wal.keys.Set(key, index)
 		} else {
@@ -907,7 +931,7 @@ func (wal *WAL[K]) load() (err error) {
 			wal.uncommittedKeys.Set(key, index)
 		}
 		wal.cache.Add(index, entry)
-		readBlockIndex += uint64(entry.Blocks())
+		readTEUIndex += uint64(entry.TEUsLen())
 		if index > maxIndex {
 			maxIndex = index
 		}
@@ -923,7 +947,7 @@ func (wal *WAL[K]) reload() (err error) {
 	wal.uncommittedKeys = btree.New[K, uint64]()
 	wal.cache.Purge()
 	wal.nextIndex = 0
-	wal.nextBlockPos = 0
+	wal.nextTEUPos = 0
 	reopenErr := wal.file.Reopen()
 	if reopenErr != nil {
 		err = errors.ServiceError("wal reload failed").WithCause(reopenErr)
@@ -933,7 +957,7 @@ func (wal *WAL[K]) reload() (err error) {
 	return
 }
 
-// CreateSnapshot contains end index
+// CreateSnapshot contains end Index
 func (wal *WAL[K]) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 	wal.truncating.Wait()
 	wal.locker.Lock()
@@ -959,11 +983,11 @@ func (wal *WAL[K]) CreateSnapshot(endIndex uint64, sink io.Writer) (err error) {
 		return
 	}
 	if hasUncommittedMin && minUncommittedIndex <= endIndex {
-		err = errors.ServiceError("wal create snapshot failed").WithCause(errors.ServiceError("min uncommitted index is less than end index"))
+		err = errors.ServiceError("wal create snapshot failed").WithCause(errors.ServiceError("min uncommitted Index is less than end Index"))
 		return
 	}
 	if endIndex < firstIndex {
-		err = errors.ServiceError("wal create snapshot failed").WithCause(errors.ServiceError("end index is less than first index"))
+		err = errors.ServiceError("wal create snapshot failed").WithCause(errors.ServiceError("end Index is less than first Index"))
 		return
 	}
 
@@ -1044,17 +1068,17 @@ func (wal *WAL[K]) TruncateFront(endIndex uint64) (err error) {
 	}
 	minUnCommittedIndex, _, hasMinUnCommitted := wal.uncommittedIndexes.Min()
 	if hasMinUnCommitted && minUnCommittedIndex <= endIndex {
-		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError(fmt.Sprintf("%d is greater and equals than min uncommitted index", endIndex)))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError(fmt.Sprintf("%d is greater and equals than min uncommitted Index", endIndex)))
 		return
 	}
 	minIndex, _, hasMinIndex := wal.indexes.Min()
 	if hasMinIndex && minIndex > endIndex {
-		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError(fmt.Sprintf("%d is less than min index", endIndex)))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError(fmt.Sprintf("%d is less than min Index", endIndex)))
 		return
 	}
 	maxIndex, _, hasMaxIndex := wal.indexes.Max()
 	if !hasMaxIndex {
-		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError("there is no max index"))
+		err = errors.ServiceError("wal truncate failed").WithCause(errors.ServiceError("there is no max Index"))
 		return
 	}
 

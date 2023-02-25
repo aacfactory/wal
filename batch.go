@@ -21,7 +21,7 @@ func (batch *Batch[K]) Write(key K, p []byte) (index uint64, err error) {
 	if batch.wal.transactionEnabled {
 		_, has := batch.wal.uncommittedKeys.Get(key)
 		if has {
-			err = errors.ServiceError("batch write failed").WithCause(errors.ServiceError("prev key was not committed or discarded"))
+			err = errors.ServiceError("batch write failed").WithCause(errors.ServiceError("prev key was not Committed or Discarded"))
 			batch.release()
 			return
 		}
@@ -34,7 +34,7 @@ func (batch *Batch[K]) Write(key K, p []byte) (index uint64, err error) {
 		return
 	}
 	index = batch.nextIndex
-	entry := NewEntry(index, kp, p)
+	entry := NewEntry(batch.wal.sot, index, kp, p)
 	if !batch.wal.transactionEnabled {
 		entry.Commit()
 	}
@@ -53,20 +53,20 @@ func (batch *Batch[K]) Flush() (err error) {
 		err = errors.ServiceError("wal batch flush failed").WithCause(ErrClosed)
 		return
 	}
-	pos := batch.wal.acquireNextBlockPos()
+	pos := batch.wal.acquireNextTEUPos()
 	writeErr := batch.wal.file.WriteAt(batch.data, pos)
 	if writeErr != nil {
 		err = errors.ServiceError("flush batch wrote failed").WithCause(writeErr)
 		return
 	}
-	entries := DecodeEntries(batch.data)
+	entries := DecodeEntries(batch.wal.sot, batch.data)
 	for i, entry := range entries {
 		if !batch.wal.transactionEnabled {
 			batch.wal.mountWriteCommitted(batch.keys[i], entry, pos)
 		} else {
 			batch.wal.mountWriteUncommitted(batch.keys[i], entry, pos)
 		}
-		pos = pos + uint64(entry.Blocks()*blockSize)
+		pos = pos + uint64(entry.TEUsLen()*batch.wal.sot.value())
 	}
 	return
 }
