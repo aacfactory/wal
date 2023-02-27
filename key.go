@@ -1,6 +1,9 @@
 package wal
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"unsafe"
+)
 
 type ordered interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64 |
@@ -54,11 +57,11 @@ func StringKeyEncoder() KeyEncoder[string] {
 type stringKeyEncoder struct{}
 
 func (k *stringKeyEncoder) Encode(key string) (p []byte, err error) {
-	p = []byte(key)
+	p = unsafe.Slice(unsafe.StringData(key), len(key))
 	return
 }
 
 func (k *stringKeyEncoder) Decode(p []byte) (key string, err error) {
-	key = string(p)
+	key = unsafe.String(unsafe.SliceData(p), len(p))
 	return
 }
